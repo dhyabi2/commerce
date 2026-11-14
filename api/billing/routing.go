@@ -48,12 +48,15 @@ type rules struct {
 	Accounts           []routing.Account           `json:"accounts"`
 	CryptoRails        []routing.CryptoRoute       `json:"cryptoRails"`
 	// Seeded says the first policy was made from the deployment's environment (seedRuntime)
-	// and the environment is not read again.
-	Seeded bool `json:"seeded,omitempty"`
+	// and the environment is not read again. SeedLevel says what that seed knew how to make:
+	// 1 the processors, the crypto accounts, MPC and Kraken; 2 also every processor's own
+	// account. A policy seeded at a lower level is topped up once, with the accounts it lacks.
+	Seeded    bool `json:"seeded,omitempty"`
+	SeedLevel int  `json:"seedLevel,omitempty"`
 }
 
 func encodeRules(p routing.Policy) string {
-	b, _ := json.Marshal(rules{p.CurrencyRules, p.CountryRules, p.BrandRules, p.IssuerCountryRules, p.Fallback, p.LocalMethods, !p.Sticky, p.LocalCurrencies, p.FXSource, p.FXFee, p.NoRounding, p.RoundingIncrements, p.Processors, p.Accounts, p.CryptoRails, true})
+	b, _ := json.Marshal(rules{p.CurrencyRules, p.CountryRules, p.BrandRules, p.IssuerCountryRules, p.Fallback, p.LocalMethods, !p.Sticky, p.LocalCurrencies, p.FXSource, p.FXFee, p.NoRounding, p.RoundingIncrements, p.Processors, p.Accounts, p.CryptoRails, true, currentSeedLevel})
 	return string(b)
 }
 
@@ -479,6 +482,12 @@ func saveRouting(ctx context.Context, scope string, p routing.Policy, by, note s
 	before, err := ReadRouting(ctx, id)
 	if err != nil {
 		return p, fault(503, "routing is temporarily unavailable; please retry", err)
+	}
+	if id == routingpolicy.Platform && canCharge(before) && !canCharge(p) {
+		// A save never takes the platform from able to charge to unable: that is a deploy
+		// with no card processor, found by its buyers.
+		why := "this policy leaves no processor that is on with an account to charge with; keep or add an account for one"
+		return p, fault(400, why, errors.New(why))
 	}
 	prev := activeVersion(ctx, id)
 	all, verr := routingpolicy.Versions(ctx, id)
@@ -920,6 +929,9 @@ type RoutingView struct {
 	Methods     []string              `json:"methods"`
 	// MethodNotes say what a method's switch does and cannot do, for the admin to label it.
 	MethodNotes []routing.MethodNote `json:"methodNotes"`
+	// Problems are what keeps this policy from charging as configured: a processor that is
+	// on and holds no account, or no way to charge a card at all. Empty when nothing does.
+	Problems []string `json:"problems"`
 }
 
 // RoutingCount is how many of the recent decisions each processor took.
@@ -981,6 +993,10 @@ func ReadRoutingView(ctx context.Context, org *organization.Organization, scope 
 	}
 	v.Eligibility, _ = eligibility(ctx, registryFor(ctx, scope))
 	v.Brands, v.Methods, v.MethodNotes = routing.Brands, routing.MethodNames, routing.MethodNotes
+	v.Problems = chargeProblems(pol)
+	if v.Problems == nil {
+		v.Problems = []string{}
+	}
 	v.Accounts = []routing.Account{}
 	if sq, err := reg.Registered(processor.Square); err == nil {
 		if lister, ok := sq.(interface {

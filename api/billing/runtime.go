@@ -76,7 +76,62 @@ func InstallRuntime(ctx context.Context) error {
 		}
 		return map[processor.ProcessorType]bool{}
 	})
-	return applyRuntime(ctx, pol, version)
+	err = applyRuntime(ctx, pol, version)
+	reportUnchargeable(ctx, pol)
+	return err
+}
+
+// chargeProblems says what keeps the policy from charging: each processor that is on and
+// charges through an account (Stripe, Square, PayPal, ...) but holds none that is on, and,
+// when that is true of every one of them, that there is no way to charge at all.
+func chargeProblems(pol routing.Policy) []string {
+	needs := map[string]bool{}
+	for _, sp := range processor.Seeds {
+		needs[sp.Processor] = true
+	}
+	var problems []string
+	on, ready := 0, 0
+	for _, r := range pol.Processors {
+		if !r.On || !needs[r.Processor] {
+			continue
+		}
+		on++
+		has := false
+		for _, a := range pol.Accounts {
+			has = has || (a.Processor == r.Processor && a.On && a.Network == "")
+		}
+		if has {
+			ready++
+		} else {
+			problems = append(problems, r.Processor+" is on and holds no account to charge with")
+		}
+	}
+	if on > 0 && ready == 0 {
+		problems = append(problems, "no processor that is on holds an account: nothing can charge a card")
+	}
+	return problems
+}
+
+// canCharge says some processor that is on holds an account to charge with.
+func canCharge(pol routing.Policy) bool {
+	for _, p := range chargeProblems(pol) {
+		if strings.HasPrefix(p, "no processor that is on") {
+			return false
+		}
+	}
+	return true
+}
+
+// reportUnchargeable says so, loudly, when the platform policy as it runs has a processor
+// on and no account for it: an alarm in the log and an event, never a silent boot.
+func reportUnchargeable(ctx context.Context, pol routing.Policy) {
+	problems := chargeProblems(pol)
+	if len(problems) == 0 {
+		return
+	}
+	log.Error("ALARM: the platform routing policy cannot charge as configured: %s", strings.Join(problems, "; "))
+	_, _ = engine.EmitBillingEvent(webhookGuardDB(ctx), "routing.unchargeable", "routing", routingpolicy.Platform, "",
+		map[string]interface{}{"problems": problems}, nil)
 }
 
 // applyRuntime puts pol under the processors and the watcher. A deposit table that does
@@ -210,35 +265,69 @@ func StartRuntimeRefresh() (stop func()) {
 	return cancel
 }
 
+// currentSeedLevel is what the seed knows how to make today: 1 the processors, the crypto
+// deposit accounts, MPC and Kraken; 2 every processor's own account as well (Stripe,
+// Square, PayPal and the rest). A policy seeded at a lower level was made by a build that
+// did not know these accounts, and is topped up once (topUpSeed).
+const currentSeedLevel = 2
+
 // seedRuntime writes the platform policy's first version from the environment the
-// deployment was configured with, once. A policy that already holds the seed mark is
-// left alone; after this runs nothing reads the environment for any of it.
+// deployment was configured with, once, and tops up a policy an older build seeded.
+//
+// A store that has never held the policy gets the whole seed. A policy seeded at a lower
+// level is read once more: each account the environment supplies that the policy lacks is
+// added, an account the policy already holds is never touched (an admin may have edited
+// it), and the policy's processors and rails are left as they are. After either, the
+// policy carries the current level and nothing reads the environment again.
 //
 // What it carries over: the processors COMMERCE_CHARGE_PROCESSORS named (Stripe alone
 // where it was unset and a Stripe key was set, every processor where neither was), the
-// crypto deposit accounts CRYPTO_DEPOSIT_* described, the MPC endpoint, and an exchange
-// account where Kraken keys were set. Secrets are never copied: an account holds the KMS
-// path they live at.
+// crypto deposit accounts CRYPTO_DEPOSIT_* described, the MPC endpoint, an exchange
+// account where Kraken keys were set, and every processor's own account. Secrets are never
+// copied: an account holds the KMS path they live at.
 func seedRuntime(ctx context.Context) error {
 	row, found, err := routingpolicy.Get(ctx, routingpolicy.Platform)
 	if err != nil {
 		return err
 	}
-	if found && seeded(row.Rules) {
+	if found && seeded(row.Rules) && seedLevel(row.Rules) >= currentSeedLevel {
 		return nil
 	}
 	pol := routing.Default()
 	var version int
 	by := "system:env-seed"
+	note := "seeded once from the deployment's environment"
 	if found {
 		pol, _ = policyOf(row)
 		version = row.Version
 		by = row.By
+		if seeded(row.Rules) {
+			// Seeded by a build that knew fewer accounts: add the ones it lacked.
+			scratch := routing.Default()
+			scratch.Accounts = nil
+			seedFromEnvironment(ctx, &scratch, os.Environ())
+			added := 0
+			for _, a := range scratch.Accounts {
+				if !hasAccount(pol, a) {
+					pol.Accounts = append(pol.Accounts, a)
+					added++
+				}
+			}
+			note = "topped up from the deployment's environment with the accounts the first seed lacked"
+			if added == 0 {
+				// Nothing to add: record the level so the environment is not read again, and
+				// change no version.
+				rows := policyRow(pol, by, version)
+				return routingpolicy.Put(ctx, routingpolicy.Platform, rows)
+			}
+		} else {
+			seedFromEnvironment(ctx, &pol, os.Environ())
+		}
+	} else {
+		seedFromEnvironment(ctx, &pol, os.Environ())
 	}
-	seedFromEnvironment(ctx, &pol, os.Environ())
 	pol = pol.Normal()
 	rows := policyRow(pol, by, version)
-	rows.Rules = markSeeded(rows.Rules)
 	all, err := routingpolicy.Versions(ctx, routingpolicy.Platform)
 	if err != nil {
 		return err
@@ -248,7 +337,7 @@ func seedRuntime(ctx context.Context) error {
 		next = all[0].N + 1
 	}
 	pj, _ := json.Marshal(pol)
-	if err := routingpolicy.PutVersion(ctx, routingpolicy.Version{Scope: routingpolicy.Platform, N: next, Policy: string(pj), By: "system:env-seed", Note: "seeded once from the deployment's environment"}); err != nil {
+	if err := routingpolicy.PutVersion(ctx, routingpolicy.Version{Scope: routingpolicy.Platform, N: next, Policy: string(pj), By: "system:env-seed", Note: note}); err != nil {
 		return err
 	}
 	rows.Version = next
@@ -256,8 +345,27 @@ func seedRuntime(ctx context.Context) error {
 		return err
 	}
 	_, _ = engine.EmitBillingEvent(webhookGuardDB(ctx), "routing.seeded", "routing", routingpolicy.Platform, "",
-		map[string]interface{}{"policy": pol, "version": next}, nil)
+		map[string]interface{}{"policy": pol, "version": next, "note": note}, nil)
 	return nil
+}
+
+// hasAccount says pol already holds an account the same as a: the same processor and id
+// (and network and asset, for a deposit account).
+func hasAccount(pol routing.Policy, a routing.Account) bool {
+	for _, x := range pol.Accounts {
+		if x.Processor == a.Processor && x.ID == a.ID && x.Network == a.Network && x.Asset == a.Asset {
+			return true
+		}
+	}
+	return false
+}
+
+func seedLevel(rules string) int {
+	var x struct {
+		Level int `json:"seedLevel"`
+	}
+	_ = json.Unmarshal([]byte(rules), &x)
+	return x.Level
 }
 
 func seeded(rules string) bool {
@@ -273,6 +381,7 @@ func unmarkSeeded(rules string) string {
 		return rules
 	}
 	delete(m, "seeded")
+	delete(m, "seedLevel")
 	b, _ := json.Marshal(m)
 	return string(b)
 }

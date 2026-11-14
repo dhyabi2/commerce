@@ -413,8 +413,19 @@ func TestAProcessorIsConfiguredFromItsAccountAndTheSecretStaysInKMS(t *testing.T
 	if _, f := WriteRouting(ctx, "", bad, "z", ""); f == nil || !p.IsAvailable(ctx) {
 		t.Fatalf("an unresolvable key was accepted or broke the running one: %v", f)
 	}
-	if _, f := WriteRouting(ctx, "", routing.Default(), "z", "no stripe account"); f != nil {
-		t.Fatal(f.Err)
+	// The last account cannot be dropped while a processor that needs one is on: that is a
+	// deploy with no way to charge a card.
+	if _, f := WriteRouting(ctx, "", routing.Default(), "z", "no stripe account"); f == nil || f.Status != 400 || !p.IsAvailable(ctx) {
+		t.Fatalf("a save that left nothing able to charge was accepted: %v", f)
+	}
+	crypto := routing.Default()
+	for _, n := range []string{"stripe", "square", "paypal"} {
+		setOn(&crypto, n, false)
+	}
+	setOn(&crypto, "kraken", true)
+	crypto.Processors = append(crypto.Processors, routing.ProcessorRule{Processor: "adyen", On: true}) // takes cards, needs no account here
+	if _, f := WriteRouting(ctx, "", crypto, "z", "account-backed processors off, no account"); f != nil {
+		t.Fatalf("a policy with every account-backed processor off was refused: %v", f.Err)
 	}
 	if p.IsAvailable(ctx) {
 		t.Fatal("the account was removed and Stripe still holds its key")
@@ -506,5 +517,103 @@ func TestTheSeedNamesEachSecretAtThePathThatResolvesOnThisDeployment(t *testing.
 		if got[k] != v {
 			t.Errorf("%s = %q, want %q", k, got[k], v)
 		}
+	}
+}
+
+// A policy a build seeded before it knew the processors' own accounts (only crypto and
+// MPC/Kraken) is topped up once with the accounts the environment supplies: the ones it
+// lacks are added, one the admin edited is left as the admin made it, nothing else moves,
+// and a second run changes nothing.
+func TestACryptoOnlySeededPolicyIsToppedUpWithTheChargeAccounts(t *testing.T) {
+	ctx := heldStore(t)
+	t.Setenv("STRIPE_SECRET_KEY", "sk_live_env")
+	t.Setenv("STRIPE_PUBLISHABLE_KEY", "pk_live_ENV")
+	t.Setenv("SQUARE_ACCESS_TOKEN", "tok")
+	t.Setenv("SQUARE_LOCATION_ID", "LOC")
+	t.Setenv("PAYPAL_CLIENT_ID", "pp")
+	t.Setenv("PAYPAL_CLIENT_SECRET", "pps")
+	t.Setenv("COMMERCE_CHARGE_PROCESSORS", "stripe,square,paypal")
+	useSecrets(t, mapSecrets{"/commerce-secrets/STRIPE_SECRET_KEY": "x", "/commerce-secrets/SQUARE_ACCESS_TOKEN": "x", "/commerce-secrets/PAYPAL_CLIENT_SECRET": "x"})
+
+	// What v1.50.221 left: seeded, with the crypto accounts only.
+	old := routing.Default()
+	for _, n := range []string{"stripe", "square", "paypal"} {
+		setOn(&old, n, true)
+	}
+	old.Accounts = []routing.Account{
+		{Processor: "mpc", ID: "service", Endpoint: "https://mpc.example", On: true},
+		{Processor: "kraken", ID: "exchange", On: true, SecretRef: "/commerce-secrets"},
+		// An account the admin already made and edited by hand.
+		{Processor: "stripe", ID: "live", On: true, Settings: []routing.Named{{Name: "publishableKey", Value: "pk_live_ADMIN"}},
+			Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}},
+	}
+	row := policyRow(old.Normal(), "z@hanzo.ai", 3)
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(row.Rules), &m)
+	delete(m, "seedLevel")
+	b, _ := json.Marshal(m)
+	row.Rules = string(b)
+	if err := routingpolicy.Put(ctx, routingpolicy.Platform, row); err != nil {
+		t.Fatal(err)
+	}
+	if err := routingpolicy.PutVersion(ctx, routingpolicy.Version{Scope: routingpolicy.Platform, N: 3, Policy: "{}", By: "system:env-seed"}); err != nil {
+		t.Fatal(err)
+	}
+	before, _, _ := ReadRoutingVersioned(ctx, "")
+	if got := chargeProblems(before); len(got) != 2 {
+		t.Fatalf("the crypto-only policy reports %v; want square and paypal holding no account", got)
+	}
+
+	if err := seedRuntime(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, v, _ := ReadRoutingVersioned(ctx, "")
+	has := func(proc, id string) *routing.Account {
+		for i, a := range after.Accounts {
+			if a.Processor == proc && a.ID == id {
+				return &after.Accounts[i]
+			}
+		}
+		return nil
+	}
+	if has("square", "live") == nil || has("paypal", "live") == nil || has("mpc", "service") == nil || has("kraken", "exchange") == nil {
+		t.Fatalf("accounts after the top-up = %+v; want square, paypal added and mpc, kraken kept", after.Accounts)
+	}
+	if st := has("stripe", "live"); st == nil || routing.Get(st.Settings, "publishableKey") != "pk_live_ADMIN" {
+		t.Fatalf("the admin's stripe account was overwritten: %+v", st)
+	}
+	if v != 4 {
+		t.Fatalf("version = %d; want 4 (one top-up)", v)
+	}
+	if got := chargeProblems(after); len(got) != 0 {
+		t.Fatalf("after the top-up: %v", got)
+	}
+	// Idempotent: a second boot adds nothing and moves no version.
+	if err := seedRuntime(ctx); err != nil {
+		t.Fatal(err)
+	}
+	again, v2, _ := ReadRoutingVersioned(ctx, "")
+	if v2 != 4 || len(again.Accounts) != len(after.Accounts) {
+		t.Fatalf("a second boot changed the policy: v%d, %d accounts", v2, len(again.Accounts))
+	}
+}
+
+// A platform policy with a processor on and no account to charge with is said loudly, and a
+// save cannot take a charging policy there.
+func TestAPolicyWithNothingToChargeWithIsReportedAndCannotBeSavedInto(t *testing.T) {
+	pol := routing.Default()
+	if got := chargeProblems(pol); len(got) != 4 || canCharge(pol) {
+		t.Fatalf("problems for a policy with cards on and no account = %v", got)
+	}
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true}}
+	if got := chargeProblems(pol); len(got) != 2 || !canCharge(pol) {
+		t.Fatalf("with a stripe account: %v (square and paypal still hold none, but cards can charge)", got)
+	}
+	crypto := routing.Default()
+	for _, n := range []string{"stripe", "square", "paypal"} {
+		setOn(&crypto, n, false)
+	}
+	if got := chargeProblems(crypto); len(got) != 0 {
+		t.Fatalf("a policy with every account-backed processor off reports %v", got)
 	}
 }
