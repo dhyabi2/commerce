@@ -11,26 +11,26 @@ import (
 // them to sellers implements GrantReader; commerce reads the grant before every charge
 // made on it.
 type Grant struct {
-	ID string
+	ID string `json:"id"`
 	// Active says the grant can still be used: it has not been revoked or deactivated.
 	// Why is the processor's reason when it is not ("revoked", "expired", ...).
-	Active bool
-	Why    string
+	Active bool   `json:"active"`
+	Why    string `json:"why"`
 	// Limits the payer set. MaxAmount is in minor units of Currency; ExpiresAt is unix
 	// seconds; RecurringInterval is "" for a one-time grant, else the period it may be
 	// charged on ("month").
-	Currency  string
-	MaxAmount int64
+	Currency  string `json:"currency"`
+	MaxAmount int64  `json:"maxAmount"`
 	// Captured is what has already been charged on the token, against MaxAmount.
-	Captured          int64
-	ExpiresAt         int64
-	RecurringInterval string
+	Captured          int64  `json:"captured"`
+	ExpiresAt         int64  `json:"expiresAt"`
+	RecurringInterval string `json:"recurringInterval"`
 	// What can be said of the payment method behind it without the credentials.
-	Country string
-	Brand   string
-	Last4   string
+	Country string `json:"country"`
+	Brand   string `json:"brand"`
+	Last4   string `json:"last4"`
 	// Test says the grant was made in the processor's test mode.
-	Test bool
+	Test bool `json:"test"`
 }
 
 // GrantReader is a processor that can say what a grant allows. An error is the
@@ -45,45 +45,45 @@ type GrantReader interface {
 // StablecoinReady says what the processor can take in stablecoins now.
 type StablecoinReady struct {
 	// On says the account can take stablecoin payments now.
-	On bool
+	On bool `json:"on"`
 	// Networks the processor's deposit mode accepts, in the processor's names, and the
 	// currency stablecoin payments are presented in ("usd" only).
-	Networks []string
-	Currency string
+	Networks []string `json:"networks"`
+	Currency string   `json:"currency"`
 	// Why is the reason when On is false.
-	Why string
+	Why string `json:"why"`
 }
 
 // StablecoinDepositIn opens a stablecoin payment of Amount (minor units of Currency, usd).
 type StablecoinDepositIn struct {
-	Amount   int64
-	Currency string
-	Network  string
-	Key      string // idempotency key
-	Metadata map[string]interface{}
-	Desc     string
+	Amount   int64                  `json:"amount"`
+	Currency string                 `json:"currency"`
+	Network  string                 `json:"network"`
+	Key      string                 // idempotency key `json:"key"`
+	Metadata map[string]interface{} `json:"metadata"`
+	Desc     string                 `json:"desc"`
 }
 
 // StablecoinDeposit is where to send the payment: the intent that tracks it and, per
 // network, the address and the token contract to send.
 type StablecoinDeposit struct {
-	ID        string
-	Amount    int64
-	Currency  string
-	Addresses []DepositAddress
+	ID        string           `json:"id"`
+	Amount    int64            `json:"amount"`
+	Currency  string           `json:"currency"`
+	Addresses []DepositAddress `json:"addresses"`
 }
 
 // DepositAddress is one network's address and the tokens it accepts.
 type DepositAddress struct {
-	Network string
-	Address string
-	Tokens  []DepositToken
+	Network string         `json:"network"`
+	Address string         `json:"address"`
+	Tokens  []DepositToken `json:"tokens"`
 }
 
 // DepositToken is one token a deposit address accepts: its symbol and contract (or mint).
 type DepositToken struct {
-	Currency string
-	Contract string
+	Currency string `json:"currency"`
+	Contract string `json:"contract"`
 }
 
 // StablecoinDepositor is a processor that takes stablecoin payments by deposit.
