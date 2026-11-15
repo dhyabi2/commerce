@@ -423,12 +423,19 @@ const currentSeedLevel = 2
 // crypto deposit accounts CRYPTO_DEPOSIT_* described, the MPC endpoint, an exchange
 // account where Kraken keys were set, and every processor's own account. Secrets are never
 // copied: an account holds the KMS path they live at.
+// holdsAccounts says the stored policy has at least one account: a policy with none, however
+// it came to be, is topped up from the environment, since nothing can charge without one.
+func holdsAccounts(row *routingpolicy.Row) bool {
+	pol, _ := policyOf(row)
+	return len(pol.Accounts) > 0
+}
+
 func seedRuntime(ctx context.Context) error {
 	row, found, err := routingpolicy.Get(ctx, routingpolicy.Platform)
 	if err != nil {
 		return err
 	}
-	if found && seeded(row.Rules) && seedLevel(row.Rules) >= currentSeedLevel {
+	if found && seeded(row.Rules) && seedLevel(row.Rules) >= currentSeedLevel && holdsAccounts(row) {
 		return nil
 	}
 	pol := routing.Default()
@@ -439,8 +446,9 @@ func seedRuntime(ctx context.Context) error {
 		pol, _ = policyOf(row)
 		version = row.Version
 		by = row.By
-		if seeded(row.Rules) {
-			// Seeded by a build that knew fewer accounts: add the ones it lacked.
+		{
+			// A stored policy (seeded by a build that knew fewer accounts, or written by an admin
+			// with none): add the accounts it lacks, and change nothing the admin set.
 			scratch := routing.Default()
 			scratch.Accounts = nil
 			seedFromEnvironment(ctx, &scratch, os.Environ())
@@ -458,8 +466,6 @@ func seedRuntime(ctx context.Context) error {
 				rows := policyRow(pol, by, version)
 				return routingpolicy.Put(ctx, routingpolicy.Platform, rows)
 			}
-		} else {
-			seedFromEnvironment(ctx, &pol, os.Environ())
 		}
 	} else {
 		seedFromEnvironment(ctx, &pol, os.Environ())
