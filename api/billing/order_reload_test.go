@@ -11,9 +11,10 @@ import (
 	"github.com/hanzoai/commerce/util/test/ae"
 )
 
-// An organization's order switches on the reload its plan switches on, as every
-// paid purchase does (planReload): the row's own figures, the default for a row
-// that states none, and nothing for a row that switches it off.
+// An organization's order switches on no automatic reload of its own: a seat plan
+// whose row carries no reload leaves the organization's rule as it was, and only a
+// row that carries one switches it on, at the row's figures, as every purchase of
+// such a plan does.
 func TestAnOrderArmsNoReloadUnlessItsPlanCarriesOne(t *testing.T) {
 	ctx := ae.NewContext()
 	defer ctx.Close()
@@ -22,14 +23,14 @@ func TestAnOrderArmsNoReloadUnlessItsPlanCarriesOne(t *testing.T) {
 		org, slug string
 		reload    *plan.Reload
 	}{
-		{"so-plain", "so-ent-plain", &plan.Reload{}},
+		{"so-plain", "so-ent-plain", nil},
+		{"so-zero", "so-ent-zero", &plan.Reload{}},
 		{"so-reload", "so-ent-reload", &plan.Reload{ThresholdCents: 2000, AmountCents: 7000}},
-		{"so-default", "so-ent-default", nil},
 	} {
 		org := moneyOrg(c.org)
 		withFakeSquare(t, squareMock("cust_"+c.org, "ccof_"+c.org, "sqpay_"+c.org))
 		row := orderRow(t, ctx, c.slug, 20, 500)
-		want := DefaultReload
+		var want plan.Reload
 		if c.reload != nil {
 			want = *c.reload
 			row.Limits.Reload = c.reload
