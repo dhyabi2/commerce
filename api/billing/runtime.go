@@ -660,13 +660,38 @@ func resolveRef(ctx context.Context, a routing.Account) string {
 // concern; the path a secret is at is the one that resolves for it.
 var kmsFolders = []string{"/commerce-secrets", "/cloud"}
 
-// kmsFolder is the folder holding name for this deployment: the first of kmsFolders where
-// it resolves, else the first (the secret is then not found, and the first run says so).
+// kmsRoot is the network's secret root: the first of kmsFolders in which any secret this
+// deployment knows of (every processor's, MPC's, Kraken's) resolves. Every ref of a seed is
+// derived from it, so one unreadable or unsealed secret cannot land in another network's folder.
+func kmsRoot(ctx context.Context) string {
+	names := []string{"MPC_API_KEY", "KRAKEN_API_KEY"}
+	for _, sp := range processor.Seeds {
+		for _, f := range sp.Fields {
+			if f.Secret {
+				names = append(names, f.Envs...)
+			}
+		}
+	}
+	for _, f := range kmsFolders {
+		for _, n := range names {
+			if secrets.String(ctx, f+"/"+n) != "" {
+				return f
+			}
+		}
+	}
+	return ""
+}
+
+// kmsFolder is the folder holding name for this deployment: where it resolves, else the
+// network's root, else the first of kmsFolders (the secret is then not found, and problems say so).
 func kmsFolder(ctx context.Context, name string) string {
 	for _, f := range kmsFolders {
 		if secrets.String(ctx, f+"/"+name) != "" {
 			return f
 		}
+	}
+	if root := kmsRoot(ctx); root != "" {
+		return root
 	}
 	log.Warn("routing seed: %s resolves in none of %v; the account will name %s/%s", name, kmsFolders, kmsFolders[0], name)
 	return kmsFolders[0]

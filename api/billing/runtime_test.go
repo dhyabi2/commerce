@@ -737,3 +737,31 @@ func TestAReaderThatFailsOnceEndsAvailableAndOneThatAlwaysFailsEndsInProblems(t 
 		t.Fatal("the failure was not recorded or the key is set")
 	}
 }
+
+// A testnet seed (secrets under /cloud) names every ref under /cloud, including a secret that
+// is not sealed yet; the ref that does not exist then shows up in problems.
+func TestATestnetSeedDerivesEveryRefFromTheNetworksRoot(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{"/cloud/STRIPE_SECRET_KEY": "k"}) // the webhook secret is not there
+	pol := routing.Default()
+	seedProcessorAccounts(ctx, &pol, map[string]string{"STRIPE_SECRET_KEY": "x", "STRIPE_WEBHOOK_SECRET": "y"})
+	var stripe routing.Account
+	for _, a := range pol.Accounts {
+		if a.Processor == "stripe" {
+			stripe = a
+		}
+	}
+	for _, n := range stripe.Secrets {
+		if !strings.HasPrefix(n.Value, "/cloud/") {
+			t.Fatalf("%s ref = %s, not under the network's root /cloud", n.Name, n.Value)
+		}
+	}
+	if len(stripe.Secrets) != 2 {
+		t.Fatalf("stripe secrets = %v", stripe.Secrets)
+	}
+	pol.Accounts = []routing.Account{stripe}
+	stripe.Secrets = stripe.Secrets[:2]
+	if p := strings.Join(chargeProblems(ctx, pol), "\n"); p != "" && strings.Contains(p, "secretKey") {
+		t.Fatalf("the key resolves under /cloud: %s", p)
+	}
+}
