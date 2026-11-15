@@ -1,6 +1,10 @@
 package processor
 
-import "context"
+import (
+	"context"
+	"strings"
+	"time"
+)
 
 // A Grant is a scoped, revocable permission from a payer (or the agent acting for them) to
 // charge a payment method once, or on a schedule, within limits. A processor that issues
@@ -15,8 +19,10 @@ type Grant struct {
 	// Limits the payer set. MaxAmount is in minor units of Currency; ExpiresAt is unix
 	// seconds; RecurringInterval is "" for a one-time grant, else the period it may be
 	// charged on ("month").
-	Currency          string
-	MaxAmount         int64
+	Currency  string
+	MaxAmount int64
+	// Captured is what has already been charged on the token, against MaxAmount.
+	Captured          int64
 	ExpiresAt         int64
 	RecurringInterval string
 	// What can be said of the payment method behind it without the credentials.
@@ -84,4 +90,24 @@ type DepositToken struct {
 type StablecoinDepositor interface {
 	StablecoinReady(ctx context.Context) StablecoinReady
 	OpenStablecoinDeposit(ctx context.Context, in StablecoinDepositIn) (*StablecoinDeposit, error)
+}
+
+// GrantRefusal says why a grant cannot be charged amount of cur at now ("" when it can),
+// with a code: token_revoked, token_expired, token_wrong_currency, token_over_limit or
+// token_not_recurring. offSession is a charge without the buyer there, which needs a token
+// that carries a recurring interval: a one-time token pays once.
+func GrantRefusal(g *Grant, amount int64, cur string, offSession bool, now time.Time) (code, why string) {
+	switch {
+	case !g.Active:
+		return "token_revoked", "the token is " + g.Why
+	case g.ExpiresAt > 0 && now.Unix() >= g.ExpiresAt:
+		return "token_expired", "the token has expired"
+	case g.Currency != "" && g.Currency != strings.ToLower(cur):
+		return "token_wrong_currency", "the token is for " + strings.ToUpper(g.Currency) + ", not " + strings.ToUpper(cur)
+	case g.MaxAmount > 0 && amount > g.MaxAmount-g.Captured:
+		return "token_over_limit", "the amount is over what the token has left"
+	case offSession && g.RecurringInterval == "":
+		return "token_not_recurring", "the token carries no recurring authorization, so it pays once"
+	}
+	return "", ""
 }

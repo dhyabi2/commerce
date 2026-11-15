@@ -49,6 +49,11 @@ func (p *Provider) Grant(ctx context.Context, id string) (*processor.Grant, erro
 			MaxAmount         int64  `json:"max_amount"`
 			RecurringInterval string `json:"recurring_interval"`
 		} `json:"usage_limits"`
+		UsageDetails struct {
+			AmountCaptured struct {
+				Value int64 `json:"value"`
+			} `json:"amount_captured"`
+		} `json:"usage_details"`
 		PaymentMethodDetails struct {
 			Card struct {
 				Brand   string `json:"brand"`
@@ -62,7 +67,7 @@ func (p *Provider) Grant(ctx context.Context, id string) (*processor.Grant, erro
 	}
 	g := &processor.Grant{
 		ID: t.ID, Active: t.DeactivatedAt == 0, Why: t.DeactivatedReason,
-		Currency: strings.ToLower(t.UsageLimits.Currency), MaxAmount: t.UsageLimits.MaxAmount, ExpiresAt: t.UsageLimits.ExpiresAt,
+		Currency: strings.ToLower(t.UsageLimits.Currency), MaxAmount: t.UsageLimits.MaxAmount, Captured: t.UsageDetails.AmountCaptured.Value, ExpiresAt: t.UsageLimits.ExpiresAt,
 		RecurringInterval: t.UsageLimits.RecurringInterval,
 		Country:           strings.ToUpper(t.PaymentMethodDetails.Card.Country), Brand: t.PaymentMethodDetails.Card.Brand, Last4: t.PaymentMethodDetails.Card.Last4,
 		Test: !t.Livemode,
@@ -80,14 +85,17 @@ var _ processor.GrantReader = (*Provider)(nil)
 // any intent exists), then a PaymentIntent is created on it and confirmed. The grant's own
 // holder, this account, is the only one Stripe lets use it; Radar, refunds and disputes
 // apply to the intent as to any card payment.
+//
+// A charge without the buyer present (a renewal) is allowed only on a token that carries a
+// recurring interval: a one-time token pays once and is never charged again.
 func (p *Provider) chargeToken(ctx context.Context, req processor.PaymentRequest) (*processor.PaymentResult, error) {
 	g, err := p.Grant(ctx, req.Token)
 	if err != nil {
-		return &processor.PaymentResult{Success: false, ErrorMessage: err.Error(), Error: err}, err
+		return refusedGrant("token_unreadable", "the token could not be read: "+err.Error())
 	}
-	if why := grantRefusal(g, int64(req.Amount), strings.ToLower(string(req.Currency)), time.Now()); why != "" {
-		e := processor.NewPaymentError(processor.Stripe, "grant_refused", why, nil)
-		return &processor.PaymentResult{Success: false, ErrorMessage: why, Error: &processor.Answer{Err: e}}, &processor.Answer{Err: e}
+	off, _ := req.Options["offSession"].(bool)
+	if code, why := processor.GrantRefusal(g, int64(req.Amount), strings.ToLower(string(req.Currency)), off, time.Now()); why != "" {
+		return refusedGrant(code, why)
 	}
 	if processor.Sanctioned(g.Country) {
 		return &processor.PaymentResult{Success: false, ErrorMessage: errSanctioned.Error(), Error: errSanctioned}, errSanctioned
@@ -99,7 +107,7 @@ func (p *Provider) chargeToken(ctx context.Context, req processor.PaymentRequest
 	params.Set("payment_method_data[shared_payment_granted_token]", req.Token)
 	params.Set("automatic_payment_methods[enabled]", "true")
 	params.Set("automatic_payment_methods[allow_redirects]", "never")
-	if off, _ := req.Options["offSession"].(bool); off {
+	if off {
 		params.Set("off_session", "true")
 	}
 	if req.Description != "" {
@@ -119,19 +127,12 @@ func (p *Provider) chargeToken(ctx context.Context, req processor.PaymentRequest
 	return resultOf(&pi)
 }
 
-// grantRefusal says why a grant cannot be charged amount of cur at now, or "".
-func grantRefusal(g *processor.Grant, amount int64, cur string, now time.Time) string {
-	switch {
-	case !g.Active:
-		return "the token is " + g.Why
-	case g.ExpiresAt > 0 && now.Unix() >= g.ExpiresAt:
-		return "the token has expired"
-	case g.Currency != "" && g.Currency != cur:
-		return "the token is for " + strings.ToUpper(g.Currency) + ", not " + strings.ToUpper(cur)
-	case g.MaxAmount > 0 && amount > g.MaxAmount:
-		return "the amount is over the token's limit"
-	}
-	return ""
+// refusedGrant is a charge refused for the token's own reasons, with the code the caller
+// reads: token_unreadable, token_revoked, token_expired, token_wrong_currency,
+// token_over_limit or token_not_recurring.
+func refusedGrant(code, why string) (*processor.PaymentResult, error) {
+	e := &processor.Answer{Err: processor.NewPaymentError(processor.Stripe, code, why, nil)}
+	return &processor.PaymentResult{Success: false, ErrorMessage: why, Error: e}, e
 }
 
 // stablecoin deposit mode.
