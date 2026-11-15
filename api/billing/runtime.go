@@ -143,6 +143,9 @@ func chargeProblems(ctx context.Context, pol routing.Policy) []string {
 			}
 			any = true
 			why := accountReasons(ctx, a)
+			if takesCardsAccount(a.Processor) && !a.Cards {
+				why = append(why, "takes no cards")
+			}
 			if len(why) == 0 {
 				usable = true
 				break
@@ -157,7 +160,7 @@ func chargeProblems(ctx context.Context, pol routing.Policy) []string {
 		case !any:
 			problems = append(problems, r.Processor+" is on and holds no account to charge with")
 		default:
-			problems = append(problems, r.Processor+" is on and no account of it resolves: "+strings.Join(reasons, "; "))
+			problems = append(problems, r.Processor+" is on and no account of it is able to charge (unchargeable): "+strings.Join(reasons, "; "))
 		}
 	}
 	if on > 0 && ready == 0 {
@@ -617,10 +620,39 @@ func seedFromEnvironment(ctx context.Context, pol *routing.Policy, environ []str
 		}
 	}
 	seedProcessorAccounts(ctx, pol, env)
+	dropInvalidSeeds(ctx, pol)
 	// The default crypto processor an operator named leads the rails for any asset.
 	if explicit := strings.ToLower(env["COMMERCE_DEFAULT_CRYPTO_PROCESSOR"]); explicit != "" {
 		pol.CryptoRails = append([]routing.CryptoRoute{{Asset: "*", Processor: explicit}}, routing.DefaultCryptoRails()...)
 	}
+}
+
+// takesCardsAccount says an account of this processor charges cards: the charge processors
+// whose accounts the seed makes (Stripe, Square, PayPal). The cards flag is what the routing
+// reads to count a processor usable, so a seeded charge account without it is unusable.
+func takesCardsAccount(proc string) bool {
+	switch proc {
+	case "stripe", "square", "paypal":
+		return true
+	}
+	return false
+}
+
+// dropInvalidSeeds removes from a seed the crypto accounts (MPC, Kraken) that an admin write
+// would refuse, naming each in the log, so a seeded policy always validates. Charge accounts
+// stay even when their secrets do not resolve: problems reports those.
+func dropInvalidSeeds(ctx context.Context, pol *routing.Policy) {
+	kept := pol.Accounts[:0]
+	for _, a := range pol.Accounts {
+		if a.Processor == string(processor.MPC) || a.Processor == string(processor.Kraken) {
+			if why := validateAccounts(ctx, routing.Policy{Accounts: []routing.Account{a}}); why != "" {
+				log.Warn("routing seed: leaving out %s account %s: %s", a.Processor, a.ID, why)
+				continue
+			}
+		}
+		kept = append(kept, a)
+	}
+	pol.Accounts = kept
 }
 
 func parseInt(s string) (int64, error) {
@@ -766,6 +798,7 @@ func seedProcessorAccounts(ctx context.Context, pol *routing.Policy, env map[str
 		if len(a.Secrets)+len(a.Settings) == 0 {
 			continue
 		}
+		a.Cards = takesCardsAccount(sp.Processor)
 		if sp.Deploys(env) {
 			a.Settings = append(a.Settings, routing.Named{Name: "deployment", Value: "true"})
 		}

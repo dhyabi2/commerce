@@ -393,7 +393,7 @@ func TestAProcessorIsConfiguredFromItsAccountAndTheSecretStaysInKMS(t *testing.T
 		t.Fatal("Stripe is available before any account holds its key")
 	}
 	pol := routing.Default()
-	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true,
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Cards: true,
 		Settings: []routing.Named{{Name: "publishableKey", Value: "pk_live_PUB"}},
 		Secrets:  []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}, {Name: "webhook", Value: "/commerce-secrets/STRIPE_WEBHOOK_SECRET"}}}}
 	saved, f := WriteRouting(ctx, "", pol, "z", "stripe keys")
@@ -545,7 +545,7 @@ func TestACryptoOnlySeededPolicyIsToppedUpWithTheChargeAccounts(t *testing.T) {
 		{Processor: "mpc", ID: "service", Endpoint: "https://mpc.example", On: true},
 		{Processor: "kraken", ID: "exchange", On: true, SecretRef: "/commerce-secrets"},
 		// An account the admin already made and edited by hand.
-		{Processor: "stripe", ID: "live", On: true, Settings: []routing.Named{{Name: "publishableKey", Value: "pk_live_ADMIN"}},
+		{Processor: "stripe", ID: "live", On: true, Cards: true, Settings: []routing.Named{{Name: "publishableKey", Value: "pk_live_ADMIN"}},
 			Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}},
 	}
 	row := policyRow(old.Normal(), "z@hanzo.ai", 3)
@@ -608,7 +608,7 @@ func TestAPolicyWithNothingToChargeWithIsReportedAndCannotBeSavedInto(t *testing
 	if got := chargeProblems(ctx, pol); len(got) != 4 || canCharge(ctx, pol) {
 		t.Fatalf("problems for a policy with cards on and no account = %v", got)
 	}
-	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}}}
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Cards: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}}}
 	if got := chargeProblems(ctx, pol); len(got) != 2 || !canCharge(ctx, pol) {
 		t.Fatalf("with a stripe account: %v (square and paypal still hold none, but cards can charge)", got)
 	}
@@ -628,18 +628,18 @@ func TestProblemsKeyOnWhatResolvesAndNameTheFailingPathAndWhy(t *testing.T) {
 	ctx := context.Background()
 	pol := routing.Default()
 	pol.Accounts = []routing.Account{
-		{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}},
-		{Processor: "square", ID: "live", On: true, Settings: []routing.Named{{Name: "locationId", Value: "LOC"}}, Secrets: []routing.Named{{Name: "accessToken", Value: "/commerce-secrets/SQUARE_ACCESS_TOKEN"}}},
-		{Processor: "paypal", ID: "live", On: true, Settings: []routing.Named{{Name: "clientId", Value: "pp"}}, Secrets: []routing.Named{{Name: "clientSecret", Value: "/commerce-secrets/PAYPAL_CLIENT_SECRET"}}},
+		{Processor: "stripe", ID: "live", On: true, Cards: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}},
+		{Processor: "square", ID: "live", On: true, Cards: true, Settings: []routing.Named{{Name: "locationId", Value: "LOC"}}, Secrets: []routing.Named{{Name: "accessToken", Value: "/commerce-secrets/SQUARE_ACCESS_TOKEN"}}},
+		{Processor: "paypal", ID: "live", On: true, Cards: true, Settings: []routing.Named{{Name: "clientId", Value: "pp"}}, Secrets: []routing.Named{{Name: "clientSecret", Value: "/commerce-secrets/PAYPAL_CLIENT_SECRET"}}},
 	}
 	// None resolves: each reader answer is a different reason.
 	secrets.Set(failingSecrets{"/commerce-secrets/STRIPE_SECRET_KEY": secrets.ErrNotFound, "/commerce-secrets/SQUARE_ACCESS_TOKEN": secrets.ErrDenied, "/commerce-secrets/PAYPAL_CLIENT_SECRET": nil})
 	t.Cleanup(func() { secrets.Set(nil) })
 	got := strings.Join(chargeProblems(ctx, pol), "\n")
 	for _, want := range []string{
-		"stripe is on and no account of it resolves: account live secret secretKey at /commerce-secrets/STRIPE_SECRET_KEY: not found",
-		"square is on and no account of it resolves: account live secret accessToken at /commerce-secrets/SQUARE_ACCESS_TOKEN: permission denied",
-		"paypal is on and no account of it resolves: account live secret clientSecret at /commerce-secrets/PAYPAL_CLIENT_SECRET: empty value",
+		"stripe is on and no account of it is able to charge (unchargeable): account live secret secretKey at /commerce-secrets/STRIPE_SECRET_KEY: not found",
+		"square is on and no account of it is able to charge (unchargeable): account live secret accessToken at /commerce-secrets/SQUARE_ACCESS_TOKEN: permission denied",
+		"paypal is on and no account of it is able to charge (unchargeable): account live secret clientSecret at /commerce-secrets/PAYPAL_CLIENT_SECRET: empty value",
 		"no processor that is on can charge",
 	} {
 		if !strings.Contains(got, want) {
@@ -697,7 +697,7 @@ func (f *flakySecrets) GetSecret(_ context.Context, ref string) ([]byte, error) 
 func TestAReaderThatFailsOnceEndsAvailableAndOneThatAlwaysFailsEndsInProblems(t *testing.T) {
 	ctx := context.Background()
 	pol := routing.Default()
-	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}}}
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Cards: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}}}
 	for _, p := range []string{"square", "paypal"} {
 		for i := range pol.Processors {
 			if pol.Processors[i].Processor == p {
@@ -775,7 +775,7 @@ func TestAMissingWebhookSecretIsASettlementProblemAndNotUnchargeable(t *testing.
 	for i := range pol.Processors {
 		pol.Processors[i].On = pol.Processors[i].Processor == "stripe"
 	}
-	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Cards: true, Secrets: []routing.Named{
 		{Name: "secretKey", Value: "/cloud/STRIPE_SECRET_KEY"}, {Name: "webhook", Value: "/cloud/STRIPE_WEBHOOK_SECRET"}}}}
 	if got := chargeProblems(ctx, pol); len(got) != 0 || !canCharge(ctx, pol) {
 		t.Fatalf("a missing webhook secret made the policy unchargeable: %v", got)
@@ -787,5 +787,53 @@ func TestAMissingWebhookSecretIsASettlementProblemAndNotUnchargeable(t *testing.
 	secrets.Set(mapSecrets{"/cloud/STRIPE_SECRET_KEY": "k", "/cloud/STRIPE_WEBHOOK_SECRET": "w"})
 	if sp := settlementProblems(ctx, pol); len(sp) != 0 {
 		t.Fatalf("resolved, still reported: %v", sp)
+	}
+}
+
+// A seeded charge account takes cards (without the flag the routing counts the processor
+// unusable); a card-less account of an on-processor is unchargeable; and the whole seed passes
+// the validation an admin write does, with an invalid MPC/Kraken account left out, not stored.
+func TestASeedOfTestnetChargeAccountsTakesCardsAndValidates(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{
+		"/cloud/STRIPE_SECRET_KEY": "k", "/cloud/STRIPE_WEBHOOK_SECRET": "w",
+		"/cloud/SQUARE_ACCESS_TOKEN": "a", "/cloud/PAYPAL_CLIENT_SECRET": "c",
+	})
+	pol := routing.Default()
+	seedFromEnvironment(ctx, &pol, []string{
+		"STRIPE_SECRET_KEY=x", "STRIPE_WEBHOOK_SECRET=y", "SQUARE_ACCESS_TOKEN=a", "SQUARE_LOCATION_ID=L",
+		"PAYPAL_CLIENT_SECRET=c", "PAYPAL_CLIENT_ID=i",
+		"MPC_ENDPOINT=http://old.example",         // not https: an admin write refuses it
+		"KRAKEN_API_KEY=k", "KRAKEN_API_SECRET=s", // unresolved: refused
+	})
+	var charge int
+	for _, a := range pol.Accounts {
+		switch a.Processor {
+		case "stripe", "square", "paypal":
+			charge++
+			if !a.Cards {
+				t.Errorf("%s %s seeded with cards false", a.Processor, a.ID)
+			}
+			for _, n := range a.Secrets {
+				if !strings.HasPrefix(n.Value, "/cloud/") {
+					t.Errorf("%s ref %s is not under /cloud", n.Name, n.Value)
+				}
+			}
+		case "mpc", "kraken":
+			t.Errorf("an invalid %s account was seeded: %+v", a.Processor, a)
+		}
+	}
+	if charge == 0 {
+		t.Fatal("no charge account seeded")
+	}
+	if why := validateAccounts(ctx, pol); why != "" {
+		t.Fatalf("the seeded policy does not validate: %s", why)
+	}
+	// A charge account that takes no cards leaves its on-processor unchargeable.
+	for i := range pol.Accounts {
+		pol.Accounts[i].Cards = false
+	}
+	if p := strings.Join(chargeProblems(ctx, pol), "\n"); !strings.Contains(p, "unchargeable") || !strings.Contains(p, "takes no cards") {
+		t.Fatalf("card-less accounts not flagged: %s", p)
 	}
 }
