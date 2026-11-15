@@ -114,6 +114,26 @@ func GetWireInstructions(recv *organization.Organization, payer string) (WireIns
 	}, nil
 }
 
+// ReadWireInstructions is the receiving bank's details for a payer, with a reference that is
+// this transfer's own (WIRE-…): the one the bank's receipt is reconciled by (ReconcileWire),
+// kept until that wire is credited. org is the payer's org, the one the reference is recorded
+// in; a caller with none gets the details under the payer's own reference, which no
+// reconcile will find.
+func ReadWireInstructions(ctx context.Context, org *organization.Organization, host, payer string) (WireInstructions, error) {
+	out, err := WireFor(ctx, host, payer)
+	if err != nil {
+		return WireInstructions{}, err
+	}
+	if org != nil {
+		ref, rerr := openWireReference(org, payer)
+		if rerr != nil {
+			return WireInstructions{}, rerr
+		}
+		out.Reference, out.Memo = ref, ref
+	}
+	return out, nil
+}
+
 // GetBillingWireInstructions is the customer's endpoint for those details. It
 // resolves the two things only a request knows — who is asking, and which host
 // they are paying on — and hands them to the read.
@@ -126,17 +146,13 @@ func GetBillingWireInstructions(c *zip.Ctx) error {
 	}
 	// Forward carries the request's caller, which the host's KMS reads to admit
 	// the brand's bank read; a raw handler's Context carries none.
-	out, err := WireFor(c.Forward(), checkout.RequestHost(c), payer)
+	org, _ := middleware.GetOrganizationOK(c)
+	out, err := ReadWireInstructions(c.Forward(), org, checkout.RequestHost(c), payer)
 	if err != nil {
-		return jsonhttp.Fail(c, 503, "Wire transfer not configured", err)
-	}
-	// The reference is this transfer's own: it is what the bank's receipt is reconciled by.
-	if org, ok := middleware.GetOrganizationOK(c); ok && org != nil {
-		ref, rerr := openWireReference(org, payer)
-		if rerr != nil {
-			return jsonhttp.Fail(c, 503, "billing is temporarily unavailable; please retry", rerr)
+		if IsWireUnconfigured(err) {
+			return jsonhttp.Fail(c, 503, "Wire transfer not configured", err)
 		}
-		out.Reference, out.Memo = ref, ref
+		return jsonhttp.Fail(c, 503, "billing is temporarily unavailable; please retry", err)
 	}
 	return c.JSON(200, out)
 }

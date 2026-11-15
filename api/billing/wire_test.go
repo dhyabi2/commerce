@@ -120,3 +120,32 @@ func TestWireEndpointReadsTheBrandsBankAsTheCaller(t *testing.T) {
 		t.Fatalf("GET /v1/billing/wire = %d %s, want Hanzo's bank", resp.StatusCode, raw)
 	}
 }
+
+// ReadWireInstructions hands out the transfer's own reference, which the reconcile finds; the
+// same payer asking again before paying gets the same one.
+func TestReadWireInstructionsCarriesAReferenceTheReconcileFinds(t *testing.T) {
+	ctx := ae.NewContext()
+	defer ctx.Close()
+	webhookOrg(t, ctx, "hanzo", true)
+	acme := webhookOrg(t, ctx, "acme", true)
+	prev := secrets.Get()
+	secrets.Set(brandStore{"orgs/hanzo/wire/WIRE_ACCOUNT_NUMBER": "000488108457", "orgs/hanzo/wire/WIRE_BANK_NAME": "Hanzo Bank"})
+	t.Cleanup(func() { secrets.Set(prev) })
+	led := newFakeLedger()
+	injectLedger(t, led)
+
+	payer := zip.WithCaller(ctx, zip.Caller{Org: "acme", User: "alice"})
+	w, err := ReadWireInstructions(payer, acme, "pay.hanzo.ai", "acme/alice")
+	if err != nil || !strings.HasPrefix(w.Reference, "WIRE-") || w.Memo != w.Reference {
+		t.Fatalf("instructions = %+v (%v); want a WIRE- reference in the reference and the memo", w, err)
+	}
+	if again, _ := ReadWireInstructions(payer, acme, "pay.hanzo.ai", "acme/alice"); again.Reference != w.Reference {
+		t.Fatalf("an unpaid wire changed its reference: %s -> %s", w.Reference, again.Reference)
+	}
+	if out, f := ReconcileWire(ctx, w.Reference, 5000, "bank-1", "z@hanzo.ai"); f != nil || !out.Credited || out.Subject != "acme/alice" {
+		t.Fatalf("the reconcile did not find the reference: %+v %v", out, f)
+	}
+	if _, err := ReadWireInstructions(ctx, acme, "pay.hanzo.ai", ""); !IsWireUnconfigured(err) {
+		t.Fatalf("a payer-less read = %v; want the rail's one refusal", err)
+	}
+}
