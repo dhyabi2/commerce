@@ -24,6 +24,7 @@ import (
 	"github.com/hanzoai/commerce/models/pendingintent"
 	"github.com/hanzoai/commerce/models/subscription"
 	"github.com/hanzoai/commerce/payment/processor"
+	orgpkg "github.com/hanzoai/commerce/pkg/org"
 	types "github.com/hanzoai/commerce/types"
 	jsonhttp "github.com/hanzoai/commerce/util/json/http"
 )
@@ -129,8 +130,13 @@ type Discovery struct {
 //
 //	GET /v1/billing/catalog
 func GetBillingCatalog(c *zip.Ctx) error {
-	org, _ := middleware.GetOrganizationOK(c)
-	out, err := ReadCatalog(c.Context(), org, checkout.RequestHost(c))
+	host := checkout.RequestHost(c)
+	org, ok := middleware.GetOrganizationOK(c)
+	if !ok || org == nil {
+		// Anonymous: the catalog is the brand the host names.
+		org, _ = orgpkg.Resolve(c.Context(), checkout.BrandSlugForHost(host))
+	}
+	out, err := ReadCatalog(c.Context(), org, host)
 	if err != nil {
 		return jsonhttp.Fail(c, 503, "the catalog is unavailable", err)
 	}
@@ -171,6 +177,55 @@ type CryptoTopupOut struct {
 	Status      string                     `json:"status"`
 }
 
+// stripeDeposit opens a Stripe stablecoin deposit of cents USD on a network, after checking
+// the account can take stablecoins now. It records nothing: each caller registers the intent
+// for what it pays.
+func stripeDeposit(ctx context.Context, org *organization.Organization, subject string, cents int64, network, key, desc string) (*processor.StablecoinDeposit, string, *PaymentFault) {
+	reg := processorsForOrg(org)
+	ready := stripeStablecoins(ctx, reg)
+	if !ready.On {
+		return nil, "", fault(503, "stablecoin payments are not available right now: "+ready.Why, nil)
+	}
+	network = strings.ToLower(strings.TrimSpace(network))
+	if network == "" {
+		network = ready.Networks[0]
+	}
+	ok := false
+	for _, n := range ready.Networks {
+		ok = ok || n == network
+	}
+	if !ok {
+		return nil, "", fault(400, "network must be one of "+strings.Join(ready.Networks, ", "), nil)
+	}
+	sp, err := reg.Existing(ctx, processor.Stripe)
+	depositor, isDep := sp.(processor.StablecoinDepositor)
+	if err != nil || !isDep {
+		return nil, "", fault(503, "Stripe is not available right now", err)
+	}
+	dep, err := depositor.OpenStablecoinDeposit(ctx, processor.StablecoinDepositIn{
+		Amount: cents, Currency: "usd", Network: network,
+		Key:      gatewayKey("deposit", subject, fmt.Sprintf("%s:%d", key, cents)),
+		Desc:     desc,
+		Metadata: map[string]interface{}{"hanzo_subject": subject, "hanzo_usd_cents": cents, "hanzo_org": org.Name, "org": org.Name, "user": strings.ToLower(subject)},
+	})
+	if err != nil {
+		return nil, "", fault(502, "the payment could not be opened", err)
+	}
+	return dep, network, nil
+}
+
+// cancelDeposit cancels a deposit that could not be recorded, so no address is handed out
+// whose money nobody could place.
+func cancelDeposit(ctx context.Context, org *organization.Organization, id string) {
+	if sp, err := processorsForOrg(org).Existing(ctx, processor.Stripe); err == nil {
+		if c, ok := sp.(interface {
+			CancelIntent(context.Context, string) error
+		}); ok {
+			_ = c.CancelIntent(ctx, id)
+		}
+	}
+}
+
 // OpenCryptoTopup opens a Stripe stablecoin deposit for a top-up. It is refused unless the
 // Stripe account can take stablecoins now.
 func OpenCryptoTopup(ctx context.Context, org *organization.Organization, in CryptoTopupIn) (*CryptoTopupOut, *PaymentFault) {
@@ -181,62 +236,32 @@ func OpenCryptoTopup(ctx context.Context, org *organization.Organization, in Cry
 	if in.AmountCents < min || in.AmountCents > max {
 		return nil, fault(400, fmt.Sprintf("amountCents must be between %d and %d", min, max), nil)
 	}
-	reg := processorsForOrg(org)
-	ready := stripeStablecoins(ctx, reg)
-	if !ready.On {
-		return nil, fault(503, "stablecoin payments are not available right now: "+ready.Why, nil)
-	}
-	network := strings.ToLower(strings.TrimSpace(in.Network))
-	if network == "" {
-		network = ready.Networks[0]
-	}
-	ok := false
-	for _, n := range ready.Networks {
-		ok = ok || n == network
-	}
-	if !ok {
-		return nil, fault(400, "network must be one of "+strings.Join(ready.Networks, ", "), nil)
-	}
 	if cerr := atCap(in.Subject); cerr != nil {
 		return nil, fault(429, cerr.Error(), cerr)
 	}
-	sp, err := reg.Existing(ctx, processor.Stripe)
-	depositor, isDep := sp.(processor.StablecoinDepositor)
-	if err != nil || !isDep {
-		return nil, fault(503, "Stripe is not available right now", err)
-	}
 	key := in.IdempotencyKey
 	if key == "" {
-		key = windowKey(fmt.Sprintf("crypto:%d:%s", in.AmountCents, network))
+		key = windowKey(fmt.Sprintf("crypto:%d:%s", in.AmountCents, in.Network))
+	}
+	dep, network, f := stripeDeposit(ctx, org, in.Subject, in.AmountCents, in.Network, key, fmt.Sprintf("Top-up %d usd for %s", in.AmountCents, in.Subject))
+	if f != nil {
+		return nil, f
 	}
 	_, polVersion, _ := ReadRoutingVersioned(ctx, org.Name)
-	out, err := depositor.OpenStablecoinDeposit(ctx, processor.StablecoinDepositIn{
-		Amount: in.AmountCents, Currency: "usd", Network: network,
-		Key:      gatewayKey("topup-crypto", in.Subject, fmt.Sprintf("%s:%d", key, in.AmountCents)),
-		Desc:     fmt.Sprintf("Top-up %d usd for %s", in.AmountCents, in.Subject),
-		Metadata: map[string]interface{}{"hanzo_subject": in.Subject, "hanzo_usd_cents": in.AmountCents, "hanzo_org": org.Name, "org": org.Name, "user": strings.ToLower(in.Subject)},
-	})
-	if err != nil {
-		return nil, fault(502, "the payment could not be opened", err)
-	}
-	if perr := pendingintent.PutQuoted(out.ID, org.Name, strings.ToLower(in.Subject), pendingintent.Topup, in.AmountCents, "usd", 0, "", polVersion, org.TestMode()); perr != nil {
-		if c, ok := sp.(interface {
-			CancelIntent(context.Context, string) error
-		}); ok {
-			_ = c.CancelIntent(ctx, out.ID)
-		}
-		log.Error("RECONCILE: stablecoin intent %s could not be recorded: %v", out.ID, perr)
+	if perr := pendingintent.PutQuoted(dep.ID, org.Name, strings.ToLower(in.Subject), pendingintent.Topup, in.AmountCents, "usd", 0, "", polVersion, org.TestMode()); perr != nil {
+		cancelDeposit(ctx, org, dep.ID)
+		log.Error("RECONCILE: stablecoin intent %s could not be recorded: %v", dep.ID, perr)
 		return nil, fault(503, "billing is temporarily unavailable; please retry", perr)
 	}
 	// A deposit confirms on chain, minutes to hours after the buyer sent it: the attempt waits.
-	if berr := pendingintent.Bind(out.ID, pendingintent.Terms{Delayed: true}); berr != nil {
-		log.Warn("stablecoin intent %s: the terms were not bound: %v", out.ID, berr)
+	if berr := pendingintent.Bind(dep.ID, pendingintent.Terms{Delayed: true}); berr != nil {
+		log.Warn("stablecoin intent %s: the terms were not bound: %v", dep.ID, berr)
 	}
-	if _, eerr := engine.EmitBillingEvent(webhookGuardDB(ctx), "topup.crypto.opened", "payment_intent", out.ID, in.Subject,
+	if _, eerr := engine.EmitBillingEvent(webhookGuardDB(ctx), "topup.crypto.opened", "payment_intent", dep.ID, in.Subject,
 		map[string]interface{}{"network": network, "usdCents": in.AmountCents, "org": org.Name, "policyVersion": polVersion}, nil); eerr != nil {
-		log.Warn("stablecoin intent %s: the opening was not recorded: %v", out.ID, eerr)
+		log.Warn("stablecoin intent %s: the opening was not recorded: %v", dep.ID, eerr)
 	}
-	return &CryptoTopupOut{IntentID: out.ID, AmountCents: in.AmountCents, Currency: "usd", UsdOnly: true, Addresses: out.Addresses, Status: "awaiting_deposit"}, nil
+	return &CryptoTopupOut{IntentID: dep.ID, AmountCents: in.AmountCents, Currency: "usd", UsdOnly: true, Addresses: dep.Addresses, Status: "awaiting_deposit"}, nil
 }
 
 type cryptoTopupRequest struct {
@@ -302,7 +327,9 @@ type OrderView struct {
 	PaymentID      string `json:"paymentId,omitempty"`
 	SubscriptionID string `json:"subscriptionId,omitempty"`
 	Plan           string `json:"plan,omitempty"`
-	CompletedAt    string `json:"completedAt,omitempty"`
+	// Token is what is left on the shared payment token the subscription renews on.
+	Token       *TokenRoom `json:"token,omitempty"`
+	CompletedAt string     `json:"completedAt,omitempty"`
 }
 
 // NextAction is a step the agent must take for the checkout to go on.
@@ -479,6 +506,9 @@ func ReadCheckout(ctx context.Context, org *organization.Organization, subject, 
 		}
 	}
 	v := checkoutView(s)
+	if v.Order != nil && v.Order.SubscriptionID != "" {
+		v.Order.Token = subscriptionRoom(ctx, org, v.Order.SubscriptionID)
+	}
 	if s.Status == checkoutsession.Pending && s.Payment == "stablecoin" {
 		v.Next = &NextAction{Type: "send_deposit", IntentID: s.Intent, Message: "waiting for the deposit to confirm on chain"}
 	}
@@ -600,8 +630,8 @@ func CompleteCheckout(ctx context.Context, org *organization.Organization, subje
 
 	switch strings.ToLower(pay.Type) {
 	case "stablecoin":
-		if s.Line != checkoutsession.Credit {
-			return release(422, "payment_not_supported", "stablecoin pays for credit; a subscription renews on a shared payment token")
+		if s.Line == checkoutsession.Plan {
+			return completePlanByDeposit(ctx, org, subject, s, key, pay.Network, release)
 		}
 		out, f := OpenCryptoTopup(ctx, org, CryptoTopupIn{Subject: subject, AmountCents: s.UsdCents, Network: pay.Network, IdempotencyKey: "checkout:" + id + ":" + key})
 		if f != nil {
@@ -966,6 +996,28 @@ func GetAgentOrder(c *zip.Ctx) error {
 		return jsonhttp.Fail(c, f.Status, f.Message, f.Err)
 	}
 	return c.JSON(200, o)
+}
+
+// SupplyAgentTokenAhead replaces the token a subscription renews on before a renewal is due.
+//
+//	POST /v1/billing/subscriptions/:id/agent-token   { token }
+func SupplyAgentTokenAhead(c *zip.Ctx) error {
+	org, subject, ok := agentCaller(c)
+	if !ok {
+		return jsonhttp.Fail(c, 401, "sign in to check out", nil)
+	}
+	var req agentTokenRequest
+	if err := c.Bind(&req); err != nil {
+		return jsonhttp.Fail(c, 400, "invalid request body", err)
+	}
+	room, aerr, f := SupplySubscriptionToken(c.Context(), org, subject, c.Param("id"), req.Token)
+	switch {
+	case f != nil:
+		return jsonhttp.Fail(c, f.Status, f.Message, f.Err)
+	case aerr != nil:
+		return c.JSON(402, map[string]any{"status": "declined", "error": aerr})
+	}
+	return c.JSON(200, map[string]any{"status": "ok", "token": room})
 }
 
 // SupplyAgentToken pays a past-due renewal with a fresh token.

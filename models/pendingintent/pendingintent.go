@@ -33,6 +33,10 @@ const (
 	// Invoice is a past-due invoice paid on-session after an off-session renewal
 	// needed its bank: finished by the next press of "pay", refunded if never.
 	Invoice = "invoice"
+	// Plan is the first period of a plan paid by a stablecoin deposit: keyed by the deposit's
+	// intent, with the checkout that bought it in Ref. The subscription opens when the deposit
+	// is reported succeeded, once; nothing refunds it.
+	Plan = "plan"
 	// Wire is a bank wire the buyer was given a reference for: keyed by that reference, it
 	// is credited when the bank's receipt of it is reconciled, once. No processor holds it.
 	Wire = "wire"

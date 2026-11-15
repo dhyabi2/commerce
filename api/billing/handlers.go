@@ -343,6 +343,7 @@ func Route(r *zip.Group, args ...zip.Handler) {
 	user.Raw(http.MethodPost, "/checkouts/:id/complete", CompleteAgentCheckout)
 	user.Raw(http.MethodGet, "/orders/:id", GetAgentOrder)
 	user.Raw(http.MethodPost, "/invoices/:id/agent-token", SupplyAgentToken)
+	user.Raw(http.MethodPost, "/subscriptions/:id/agent-token", SupplyAgentTokenAhead)
 
 	// What is for sale, in dollars, and how an agent buys it. Public: an agent reads it
 	// before it has a token.

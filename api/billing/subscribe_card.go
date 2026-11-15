@@ -1942,6 +1942,10 @@ func chargeProvider(org *organization.Organization, buyerPresent bool) engine.Pr
 		if err := pm.GetById(sub.DefaultPaymentMethod); err != nil {
 			return "", fmt.Errorf("payment method %s not found: %w", sub.DefaultPaymentMethod, err)
 		}
+		if pm.Type == stablecoinMethod {
+			// Paid by deposit: the renewal opens one and the subscription waits, past due, for it.
+			return collectByDeposit(ctx, org, sub, pm, inv, amountCents)
+		}
 		cardID := strings.TrimSpace(pm.ProviderRef)
 		if cardID == "" {
 			return "", fmt.Errorf("payment method %s has no card-on-file token", pm.Id())
