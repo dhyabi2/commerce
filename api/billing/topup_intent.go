@@ -106,7 +106,7 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 	}
 	key := in.IdempotencyKey
 	if key == "" {
-		key = windowKey(fmt.Sprintf("local:%d:%s:%s", in.AmountCents, cur, d.Country))
+		key = windowKey(fmt.Sprintf("local:%d:%s:%s:%s", in.AmountCents, cur, d.Country, strings.ToLower(in.Method)))
 		// A derived key replays an intent that can still be paid, and only that. A
 		// buyer who pressed twice gets the one unpaid intent back; one who comes back
 		// after paying (or after it was cancelled or is processing) gets a new one, not
@@ -122,7 +122,8 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 		}
 		n := 0
 		for _, p := range prior {
-			if p.Cents != in.AmountCents || p.PaidCurrency != paidCur {
+			if p.Cents != in.AmountCents || p.PaidCurrency != paidCur || in.Method != "" {
+				// (a checkout for one method is its own intent, never an all-methods one replayed)
 				continue
 			}
 			n++
@@ -190,9 +191,23 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 			walletConfig = id
 		}
 	}
+	excluded, ach := bankExclusions(ctx, sp, pol, cur, in.AmountCents)
+	verification := ""
+	if ach {
+		verification = "automatic"
+	}
+	var only []string
+	if strings.EqualFold(in.Method, "us_bank_account") {
+		// A checkout for the bank debit alone: refused where the debit is not on offer.
+		if !ach {
+			return nil, fault(422, "bank transfer (ACH) is not available for this payment", nil)
+		}
+		only = []string{"us_bank_account"}
+	}
 	out, err := maker.CreateLocalIntent(ctx, processor.LocalIntent{
-		Customer: customer, ReceiptEmail: payer.Email,
-		Amount: paid, Currency: cur, Excluded: pol.Off(), Configuration: walletConfig, QuoteID: quote.QuoteID,
+		Only:     only,
+		Customer: customer, ReceiptEmail: payer.Email, Verification: verification,
+		Amount: paid, Currency: cur, Excluded: excluded, Configuration: walletConfig, QuoteID: quote.QuoteID,
 		Key:      gatewayKey("topup-local", in.Subject, fmt.Sprintf("%s:%d", key, paid)),
 		Desc:     fmt.Sprintf("Top-up %d usd for %s", in.AmountCents, in.Subject),
 		Metadata: map[string]interface{}{"hanzo_subject": in.Subject, "hanzo_usd_cents": in.AmountCents, "hanzo_org": org.Name, "org": org.Name, "user": strings.ToLower(in.Subject)},
@@ -215,11 +230,17 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 		log.Error("RECONCILE: intent %s could not be recorded: %v", out.ID, perr)
 		return nil, fault(503, "billing is temporarily unavailable; please retry", perr)
 	}
+	if cur == "usd" && ach {
+		// A bank debit settles days after the buyer left: the attempt waits for it.
+		if berr := pendingintent.Bind(out.ID, pendingintent.Terms{Delayed: true}); berr != nil {
+			log.Warn("topup intent: the terms of %s were not bound: %v", out.ID, berr)
+		}
+	}
 	if cur != "usd" {
 		// The terms the quote was made on are bound to this attempt, once: the rate
 		// disclosed is the rate charged, and a refund or a record reads it back.
 		if berr := pendingintent.Bind(out.ID, pendingintent.Terms{Rate: quote.Rate, RateSource: quote.Source, QuoteID: quote.QuoteID, BaseRate: quote.BaseRate, FeeRate: quote.FeeRate, Premium: quote.Premium,
-			ExchangeRate: quote.ExchangeRate, ReferenceRate: quote.ReferenceRate, ReferenceProvider: quote.ReferenceProvider, FXFee: quote.FXFee, LockExpiresAt: quote.LockExpiresAt, Delayed: lockFor(in.Method) == fx.LockDay}); berr != nil {
+			ExchangeRate: quote.ExchangeRate, ReferenceRate: quote.ReferenceRate, ReferenceProvider: quote.ReferenceProvider, FXFee: quote.FXFee, LockExpiresAt: quote.LockExpiresAt, Delayed: lockFor(in.Method) == fx.LockDay || ach}); berr != nil {
 			log.Warn("topup intent: the terms of %s were not bound: %v", out.ID, berr)
 		}
 	}
@@ -303,6 +324,7 @@ func CreateTopupIntent(c *zip.Ctx) error {
 	}
 	out, f := OpenTopupIntent(c.Context(), org, TopupIntentIn{
 		Subject: userBillingKey(c), Country: country, AmountCents: req.AmountCents,
+		Currency: strings.TrimSpace(req.Currency), Method: policyMethod(req.Method),
 		IdempotencyKey: strings.TrimSpace(c.Header("X-Idempotency-Key")),
 		Payer:          PayerIn{Email: iamEmail(c)},
 	})
@@ -331,4 +353,44 @@ func GetTopupIntent(c *zip.Ctx) error {
 func iamEmail(c *zip.Ctx) string {
 	e, _ := c.Locals("iam_email").(string)
 	return strings.TrimSpace(e)
+}
+
+// bankExclusions are the payment method types the Payment Element must leave out for a
+// payment of usdCents in cur: the policy's switched-off methods; every method whose
+// account capability is not active (a method is shown only where Stripe can take it); and
+// ACH unless the payment is in dollars and within the per-attempt limit. ach says the
+// bank debit stays on offer.
+func bankExclusions(ctx context.Context, sp processor.PaymentProcessor, pol routing.Policy, cur string, usdCents int64) (excluded []string, ach bool) {
+	excluded = pol.Off()
+	skip := map[string]bool{}
+	for _, m := range excluded {
+		skip[m] = true
+	}
+	drop := func(m string) {
+		if !skip[m] {
+			skip[m] = true
+			excluded = append(excluded, m)
+		}
+	}
+	if c, ok := sp.(processor.Capable); ok {
+		have := c.Methods(ctx)
+		for _, m := range routing.BankMethodNames() {
+			if !have[m] {
+				drop(m)
+			}
+		}
+	}
+	if cur != "usd" || usdCents > routing.ACHMaxCents {
+		drop("us_bank_account")
+	}
+	return excluded, !skip["us_bank_account"]
+}
+
+// policyMethod is the policy's name for a method a client asks for: "ach" is Stripe's bank debit.
+func policyMethod(m string) string {
+	m = strings.ToLower(strings.TrimSpace(m))
+	if m == "ach" {
+		return "us_bank_account"
+	}
+	return m
 }

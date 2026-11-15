@@ -290,8 +290,7 @@ func takesCurrency(ctx context.Context, reg *processor.Registry, via processor.P
 // lockFor is how long a rate is locked for a payment opened with method: a day for a
 // voucher or a bank transfer that settles after the buyer has left, an hour otherwise.
 func lockFor(method string) fx.Lock {
-	switch strings.ToLower(method) {
-	case "pix", "boleto", "oxxo", "sepa_debit":
+	if routing.DelayedMethod(method) {
 		return fx.LockDay
 	}
 	return fx.LockHour
@@ -814,7 +813,7 @@ func place(ctx context.Context, org *organization.Organization, in RouteIn, live
 		}
 		d.Quote = q
 	}
-	d.Alternatives = alternativesFor(ctx, reg, pol, country)
+	d.Alternatives = alternativesFor(ctx, org, reg, pol, country)
 	d.Crypto = cryptoRoutesFor(ctx, reg, pol)
 	d.LocalCurrency, d.Version = pol.LocalCurrency(country), polVersion
 	if live {
@@ -866,7 +865,7 @@ var cryptoServes = func(ctx context.Context) bool {
 // alternativesFor are the other ways a buyer in country may pay, beyond the card
 // slot: PayPal wherever PayPal operates and the deployment allows it and the policy
 // has it on, and native crypto where a deposit watcher is really running.
-func alternativesFor(ctx context.Context, reg *processor.Registry, pol routing.Policy, country string) []string {
+func alternativesFor(ctx context.Context, org *organization.Organization, reg *processor.Registry, pol routing.Policy, country string) []string {
 	alt := []string{}
 	if pol.On(processor.PayPal) && payment.IsPayPalCountry(country) && !processor.DisabledByPolicy(processor.PayPal) {
 		if p, err := reg.Registered(processor.PayPal); err == nil && p.IsAvailable(ctx) {
@@ -876,6 +875,7 @@ func alternativesFor(ctx context.Context, reg *processor.Registry, pol routing.P
 	if pol.On(routing.CryptoRail) && (pol.StripeCrypto() || cryptoServes(ctx)) {
 		alt = append(alt, "crypto")
 	}
+	alt = append(alt, bankAlternatives(ctx, org, reg, pol, country)...)
 	return alt
 }
 
@@ -985,6 +985,11 @@ func ReadRoutingView(ctx context.Context, org *organization.Organization, scope 
 		case processor.PayPal:
 			p, perr := reg.Registered(t)
 			ok = perr == nil && p.IsAvailable(ctx) && !processor.DisabledByPolicy(t)
+		case processor.Kraken, processor.MPC:
+			// Not card processors: available as the deposit rail reads them, configured with
+			// credentials that resolved.
+			p, perr := processor.Global().Registered(t)
+			ok = perr == nil && p.IsAvailable(ctx)
 		default:
 			_, ferr := reg.Fiat(ctx, processor.Need{Currency: currency.USD, Method: "card", Want: t})
 			ok = ferr == nil
@@ -1179,4 +1184,38 @@ func RestoreRoutingHandler(c *zip.Ctx) error {
 		return jsonhttp.Fail(c, f.Status, f.Message, f.Err)
 	}
 	return c.JSON(200, p)
+}
+
+// bankAlternatives are the bank payments offered to a buyer in country: "ach" and the local
+// bank methods Stripe takes there, each only where the account's capability for it is active
+// and the policy has it on, and "wire" where the org holds receiving details.
+func bankAlternatives(ctx context.Context, org *organization.Organization, reg *processor.Registry, pol routing.Policy, country string) []string {
+	var out []string
+	if pol.On(processor.Stripe) {
+		if p, err := reg.Registered(processor.Stripe); err == nil && p.IsAvailable(ctx) {
+			if c, ok := p.(processor.Capable); ok {
+				have := c.Methods(ctx)
+				for _, m := range routing.BankMethods(country) {
+					if !have[m] || !pol.MethodOn(m) {
+						continue
+					}
+					if m == "us_bank_account" {
+						m = "ach"
+					}
+					out = append(out, m)
+				}
+			}
+		}
+	}
+	if org != nil && wireConfigured(ctx, org) {
+		out = append(out, "wire")
+	}
+	return out
+}
+
+// wireConfigured says the org holds the details a wire is sent to.
+func wireConfigured(ctx context.Context, org *organization.Organization) bool {
+	recv := *org
+	payment.Hydrate(ctx, &recv, "wire")
+	return recv.Wire.AccountNumber != "" || recv.Wire.IBAN != ""
 }

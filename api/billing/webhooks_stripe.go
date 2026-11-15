@@ -76,7 +76,7 @@ func normalizeStripeWebhookEvent(evt *processor.WebhookEvent) {
 		// payment_intent.succeeded credits. They are recorded, and a cancelled payment
 		// closes its waiting record.
 		out["id"], out["payment_intent"] = stringField(obj, "id"), stringField(obj, "id")
-		copyKeys("amount", "currency")
+		copyKeys("amount", "currency", "latest_charge")
 	case "refund.succeeded": // charge.refunded
 		out["charge"] = stringField(obj, "id")
 		copyKeys("currency")

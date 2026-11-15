@@ -33,6 +33,9 @@ const (
 	// Invoice is a past-due invoice paid on-session after an off-session renewal
 	// needed its bank: finished by the next press of "pay", refunded if never.
 	Invoice = "invoice"
+	// Wire is a bank wire the buyer was given a reference for: keyed by that reference, it
+	// is credited when the bank's receipt of it is reconciled, once. No processor holds it.
+	Wire = "wire"
 )
 
 // Intent is one PaymentIntent waiting on its buyer.

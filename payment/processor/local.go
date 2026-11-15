@@ -25,6 +25,9 @@ type LocalIntent struct {
 	Desc     string
 	// Excluded are payment method types the Payment Element must not offer.
 	Excluded []string
+	// Only, when set, restricts the intent to these payment method types (a checkout for
+	// one method: a bank debit). Excluded and Configuration then do not apply.
+	Only []string
 	// Configuration is a Payment Method Configuration id to offer methods from, or "".
 	Configuration string
 	// Customer is the payer's customer at the processor; ReceiptEmail their email.
@@ -33,6 +36,17 @@ type LocalIntent struct {
 	// QuoteID is the processor's locked exchange rate (RateQuote.ID) the intent is
 	// bound to, so the processor converts at the rate the buyer was quoted. "" for none.
 	QuoteID string
+	// Verification, for the bank debits: how the bank account is verified, "automatic" being
+	// instant verification through the bank's login (Financial Connections) and microdeposits
+	// when the bank is not covered. "" leaves the processor's own default.
+	Verification string
+}
+
+// Capable is a processor that can say which payment methods its account takes now (not
+// which exist): a method name as the policy writes it ("us_bank_account", "sepa_debit",
+// "pix", "upi", ...) is true when the account's capability for it is active.
+type Capable interface {
+	Methods(ctx context.Context) map[string]bool
 }
 
 // RateQuoter is a processor that quotes its own exchange rate to USD, the currency it

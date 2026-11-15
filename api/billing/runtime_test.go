@@ -965,3 +965,18 @@ func TestTheTopUpRunsOnTheAdminWrittenPoliciesLiveOnProdAndTestnet(t *testing.T)
 		}
 	}
 }
+
+// Secrets kept at Hanzo's org root are found by the seed, and name that root.
+func TestASeedFindsSecretsAtTheOrgRoot(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{"/orgs/hanzo/commerce-secrets/STRIPE_SECRET_KEY": "k"})
+	pol := routing.Default()
+	seedProcessorAccounts(ctx, &pol, map[string]string{"STRIPE_SECRET_KEY": "x", "STRIPE_WEBHOOK_SECRET": "y"})
+	for _, a := range pol.Accounts {
+		for _, n := range a.Secrets {
+			if !strings.HasPrefix(n.Value, "/orgs/hanzo/commerce-secrets/") {
+				t.Errorf("%s ref %s is not at the org root", n.Name, n.Value)
+			}
+		}
+	}
+}

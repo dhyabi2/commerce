@@ -10,6 +10,7 @@ import (
 
 	"github.com/hanzoai/commerce/checkout"
 	"github.com/hanzoai/commerce/datastore"
+	"github.com/hanzoai/commerce/middleware"
 	"github.com/hanzoai/commerce/models/organization"
 	"github.com/hanzoai/commerce/payment"
 	jsonhttp "github.com/hanzoai/commerce/util/json/http"
@@ -128,6 +129,14 @@ func GetBillingWireInstructions(c *zip.Ctx) error {
 	out, err := WireFor(c.Forward(), checkout.RequestHost(c), payer)
 	if err != nil {
 		return jsonhttp.Fail(c, 503, "Wire transfer not configured", err)
+	}
+	// The reference is this transfer's own: it is what the bank's receipt is reconciled by.
+	if org, ok := middleware.GetOrganizationOK(c); ok && org != nil {
+		ref, rerr := openWireReference(org, payer)
+		if rerr != nil {
+			return jsonhttp.Fail(c, 503, "billing is temporarily unavailable; please retry", rerr)
+		}
+		out.Reference, out.Memo = ref, ref
 	}
 	return c.JSON(200, out)
 }
