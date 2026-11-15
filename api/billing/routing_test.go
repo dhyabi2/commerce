@@ -175,7 +175,7 @@ func routingOrg(ctx context.Context, t *testing.T) *organization.Organization {
 	return org
 }
 
-func TestAProcessorThatIsDownHandsNewBuyersToTheOtherNeverASavedCard(t *testing.T) {
+func TestAProcessorThatIsDownHandsBuyersToTheOtherAndASavedCardIsNotOffered(t *testing.T) {
 	ctx := heldStore(t)
 	org := routingOrg(ctx, t)
 	if _, f := WriteRouting(ctx, org.Name, func() routing.Policy { q := withWeight(100); return q }(), "z", ""); f != nil {
@@ -200,9 +200,16 @@ func TestAProcessorThatIsDownHandsNewBuyersToTheOtherNeverASavedCard(t *testing.
 	if err := pm.Create(); err != nil {
 		t.Fatal(err)
 	}
-	if d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: "DE"}); f == nil {
-		t.Fatalf("a Square holder must not be moved to Stripe while Square is down: %+v", d)
+	// While Square is down its saved card is not offered and the checkout falls through to
+	// the processor that can charge.
+	if d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: "DE"}); f != nil || d.Processor != processor.Stripe || d.Reason == "saved" {
+		t.Fatalf("a Square holder falls through to Stripe while Square is down: %+v %v", d, f)
 	}
+	useRails(t, false, false)
+	if d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: "DE"}); f == nil || f.Status != 503 {
+		t.Fatalf("with no processor able to charge the answer is 503: %+v %v", d, f)
+	}
+	useRails(t, false, true)
 	useRails(t, true, true)
 	if d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: "DE"}); f != nil || d.Processor != processor.Square || d.Reason != "saved" {
 		t.Fatalf("a saved Square card stays on Square: %+v %v", d, f)
@@ -1134,4 +1141,32 @@ func contains(l []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// A saved card holds the buyer to its processor only while that processor can charge the
+// checkout's currency: a saved Square card in euros, rupees or reais routes to Stripe, in
+// dollars it stays on Square, and the same rule answers the top-up intent.
+func TestASavedCardOnlyHoldsTheBuyerWhereItsProcessorCanCharge(t *testing.T) {
+	ctx := heldStore(t)
+	org := routingOrg(ctx, t)
+	useRails(t, true, true)
+	db := datastore.New(org.Namespaced(ctx))
+	pm := paymentmethod.New(db)
+	pm.CustomerId, pm.Type, pm.ProviderType, pm.IsDefault = "holder", "card", "square", true
+	if err := pm.Create(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ country, cur string }{{"DE", "eur"}, {"IN", "inr"}, {"BR", "brl"}} {
+		d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: tc.country, Currency: tc.cur})
+		if f != nil || d.Processor != processor.Stripe || d.Reason == "saved" {
+			t.Fatalf("a saved Square card paying in %s: %+v %v; want Stripe, the card not offered", tc.cur, d, f)
+		}
+	}
+	if d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: "US", Currency: "usd"}); f != nil || d.Processor != processor.Square || d.Reason != "saved" {
+		t.Fatalf("a saved Square card paying in dollars stays on Square: %+v %v", d, f)
+	}
+	// The top-up intent follows the same rule: a euro top-up is Stripe's, not a 503.
+	if _, f := OpenTopupIntent(ctx, org, TopupIntentIn{Subject: "holder", Country: "DE", AmountCents: 500, Currency: "eur"}); f != nil && f.Status == 503 && strings.Contains(f.Message, "saved card") {
+		t.Fatalf("a euro top-up with a saved Square card answered the saved card's 503: %v", f.Message)
+	}
 }

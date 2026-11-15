@@ -716,11 +716,18 @@ func place(ctx context.Context, org *organization.Organization, in RouteIn, live
 	if err != nil {
 		return nil, fault(503, "routing is temporarily unavailable; please retry", err)
 	}
-	saved := savedProcessor(ctx, org, in.Subject)
 	reg := processorsForOrg(org)
 	cur := currency.Type(strings.ToLower(strings.TrimSpace(in.Currency)))
 	if cur == "" {
 		cur = currency.USD
+	}
+	// A saved card holds the buyer to its processor only while that processor can charge
+	// this checkout's currency now. When it cannot (Square in euros, a processor that is
+	// down), the saved step does not apply: the checkout falls through to eligibility and the
+	// merchant step like a buyer with no saved card, and the saved card is simply not offered.
+	saved := savedProcessor(ctx, org, in.Subject)
+	if saved != "" && !take2(ctx, reg, cur, saved) {
+		saved = ""
 	}
 	// A Square charge begun for this payer and not yet known to have ended holds them
 	// where they are: no other processor is offered until it is known whether the
@@ -766,7 +773,7 @@ func place(ctx context.Context, org *organization.Organization, in RouteIn, live
 	// issuing country stored with a saved card. A new card is tokenized inside the
 	// processor's own form, so nothing is known of it yet.
 	brand, issuer := in.Brand, in.IssuerCountry
-	if brand == "" && issuer == "" {
+	if brand == "" && issuer == "" && saved != "" {
 		brand, issuer = savedCardMeta(ctx, org, in.Subject)
 	}
 	d := pol.Decide(routing.Input{Org: org.Name, Key: in.Subject, Country: country, Saved: saved, Assigned: prior,
@@ -788,10 +795,6 @@ func place(ctx context.Context, org *organization.Organization, in RouteIn, live
 		return err == nil
 	}
 	if d.Reason != "saved" && !take(d.Processor) || d.Reason == "saved" && !take2(ctx, reg, cur, d.Processor) {
-		if saved != "" {
-			// A saved card is charged where it was saved or not at all.
-			return nil, fault(503, "your saved card's processor is unavailable right now; please retry shortly", nil)
-		}
 		// The fallback order, before any payment exists: the admin's list, else the
 		// other card processor.
 		picked := false
