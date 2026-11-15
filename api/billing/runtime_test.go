@@ -857,95 +857,111 @@ func TestTheTopUpRunsOnTheAdminWrittenPoliciesLiveOnProdAndTestnet(t *testing.T)
 		{"testnet v11, seeded flag and level 2", "/cloud", "policy-testnet-v11.json", 11, true, true},
 		{"testnet v11, no seeded flag", "/cloud", "policy-testnet-v11.json", 11, false, false},
 	} {
-		t.Run(fx.name, func(t *testing.T) {
-			ctx := heldStore(t)
-			t.Setenv("STRIPE_SECRET_KEY", "x")
-			t.Setenv("STRIPE_WEBHOOK_SECRET", "x")
-			t.Setenv("SQUARE_ACCESS_TOKEN", "x")
-			t.Setenv("SQUARE_LOCATION_ID", "LOC")
-			t.Setenv("PAYPAL_CLIENT_ID", "pp")
-			t.Setenv("PAYPAL_CLIENT_SECRET", "x")
-			useSecrets(t, mapSecrets{
-				fx.root + "/STRIPE_SECRET_KEY": "v", fx.root + "/STRIPE_WEBHOOK_SECRET": "v",
-				fx.root + "/SQUARE_ACCESS_TOKEN": "v", fx.root + "/PAYPAL_CLIENT_SECRET": "v",
-			})
-			// The policy as the admin routing GET returned it live (testdata, refs and paths only).
-			raw, err := os.ReadFile("testdata/" + fx.file)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var old routing.Policy
-			if err := json.Unmarshal(raw, &old); err != nil {
-				t.Fatal(err)
-			}
-			if len(old.Accounts) != 0 {
-				t.Fatal("the live fixture holds accounts")
-			}
-			wantFallback := append([]string(nil), old.Fallback...)
-			row := policyRow(old.Normal(), "z@hanzo.ai", fx.version)
-			var m map[string]json.RawMessage
-			_ = json.Unmarshal([]byte(row.Rules), &m)
-			if !fx.level {
-				delete(m, "seedLevel")
-			}
-			if !fx.seeded {
-				delete(m, "seeded")
-			}
-			b, _ := json.Marshal(m)
-			row.Rules = string(b)
-			if err := routingpolicy.Put(ctx, routingpolicy.Platform, row); err != nil {
-				t.Fatal(err)
-			}
-			if err := routingpolicy.PutVersion(ctx, routingpolicy.Version{Scope: routingpolicy.Platform, N: fx.version, Policy: "{}", By: "z@hanzo.ai"}); err != nil {
-				t.Fatal(err)
-			}
-			before, _, _ := ReadRoutingVersioned(ctx, "")
-			if canCharge(ctx, before) {
-				t.Fatal("the fixture can already charge; it is not the live shape")
-			}
+		for _, shape := range []string{"accounts null", "accounts empty list"} {
+			t.Run(fx.name+", "+shape, func(t *testing.T) {
+				ctx := heldStore(t)
+				t.Setenv("STRIPE_SECRET_KEY", "x")
+				t.Setenv("STRIPE_WEBHOOK_SECRET", "x")
+				t.Setenv("SQUARE_ACCESS_TOKEN", "x")
+				t.Setenv("SQUARE_LOCATION_ID", "LOC")
+				t.Setenv("PAYPAL_CLIENT_ID", "pp")
+				t.Setenv("PAYPAL_CLIENT_SECRET", "x")
+				useSecrets(t, mapSecrets{
+					fx.root + "/STRIPE_SECRET_KEY": "v", fx.root + "/STRIPE_WEBHOOK_SECRET": "v",
+					fx.root + "/SQUARE_ACCESS_TOKEN": "v", fx.root + "/PAYPAL_CLIENT_SECRET": "v",
+				})
+				// The policy as the admin routing GET returned it live (testdata, refs and paths only).
+				raw, err := os.ReadFile("testdata/" + fx.file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var old routing.Policy
+				if err := json.Unmarshal(raw, &old); err != nil {
+					t.Fatal(err)
+				}
+				if len(old.Accounts) != 0 {
+					t.Fatal("the live fixture holds accounts")
+				}
+				wantFallback := append([]string(nil), old.Fallback...)
+				row := policyRow(old.Normal(), "z@hanzo.ai", fx.version)
+				var m map[string]json.RawMessage
+				_ = json.Unmarshal([]byte(row.Rules), &m)
+				if !fx.level {
+					delete(m, "seedLevel")
+				}
+				if !fx.seeded {
+					delete(m, "seeded")
+				}
+				if shape == "accounts null" {
+					m["accounts"] = json.RawMessage("null") // the admin GET returns null, not []
+				}
+				b, _ := json.Marshal(m)
+				row.Rules = string(b)
+				if err := routingpolicy.Put(ctx, routingpolicy.Platform, row); err != nil {
+					t.Fatal(err)
+				}
+				if err := routingpolicy.PutVersion(ctx, routingpolicy.Version{Scope: routingpolicy.Platform, N: fx.version, Policy: "{}", By: "z@hanzo.ai"}); err != nil {
+					t.Fatal(err)
+				}
+				before, _, _ := ReadRoutingVersioned(ctx, "")
+				if canCharge(ctx, before) {
+					t.Fatal("the fixture can already charge; it is not the live shape")
+				}
 
-			if err := seedRuntime(ctx); err != nil {
-				t.Fatal(err)
-			}
-			after, v, _ := ReadRoutingVersioned(ctx, "")
-			if v != fx.version+1 {
-				t.Fatalf("version = %d; want %d (one top-up)", v, fx.version+1)
-			}
-			for _, proc := range []string{"stripe", "square", "paypal"} {
-				found := false
-				for _, a := range after.Accounts {
-					if a.Processor != proc {
-						continue
-					}
-					found = true
-					if !a.Cards {
-						t.Errorf("%s %s cards = false", proc, a.ID)
-					}
-					for _, n := range a.Secrets {
-						if !strings.HasPrefix(n.Value, fx.root+"/") {
-							t.Errorf("%s %s ref %s is not under %s", proc, n.Name, n.Value, fx.root)
+				if err := seedRuntime(ctx); err != nil {
+					t.Fatal(err)
+				}
+				after, v, _ := ReadRoutingVersioned(ctx, "")
+				if v != fx.version+1 {
+					t.Fatalf("version = %d; want %d (one top-up)", v, fx.version+1)
+				}
+				for _, proc := range []string{"stripe", "square", "paypal"} {
+					found := false
+					for _, a := range after.Accounts {
+						if a.Processor != proc {
+							continue
+						}
+						found = true
+						if !a.Cards {
+							t.Errorf("%s %s cards = false", proc, a.ID)
+						}
+						for _, n := range a.Secrets {
+							if !strings.HasPrefix(n.Value, fx.root+"/") {
+								t.Errorf("%s %s ref %s is not under %s", proc, n.Name, n.Value, fx.root)
+							}
 						}
 					}
+					if !found {
+						t.Errorf("no %s account after the top-up", proc)
+					}
 				}
-				if !found {
-					t.Errorf("no %s account after the top-up", proc)
+				if why := validateAccounts(ctx, after); why != "" {
+					t.Fatalf("the topped-up policy does not validate: %s", why)
 				}
-			}
-			if why := validateAccounts(ctx, after); why != "" {
-				t.Fatalf("the topped-up policy does not validate: %s", why)
-			}
-			if got := chargeProblems(ctx, after); len(got) != 0 {
-				t.Fatalf("problems after the top-up: %v", got)
-			}
-			if strings.Join(after.Fallback, ",") != strings.Join(wantFallback, ",") {
-				t.Fatalf("the admin's fallback was overwritten: %v -> %v", wantFallback, after.Fallback)
-			}
-			if err := seedRuntime(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if _, v2, _ := ReadRoutingVersioned(ctx, ""); v2 != v {
-				t.Fatalf("a second boot moved the version: %d -> %d", v, v2)
-			}
-		})
+				if got := chargeProblems(ctx, after); len(got) != 0 {
+					t.Fatalf("problems after the top-up: %v", got)
+				}
+				if strings.Join(after.Fallback, ",") != strings.Join(wantFallback, ",") {
+					t.Fatalf("the admin's fallback was overwritten: %v -> %v", wantFallback, after.Fallback)
+				}
+				if err := seedRuntime(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if _, v2, _ := ReadRoutingVersioned(ctx, ""); v2 != v {
+					t.Fatalf("a second boot moved the version: %d -> %d", v, v2)
+				}
+				// Kraken and MPC are off though the rails still list them: crypto offers only the
+				// Stripe stablecoins.
+				reg := processor.NewRegistry(processor.DefaultConfig())
+				reg.Register(newRail(processor.Stripe, true))
+				got := map[string]string{}
+				for _, r := range cryptoRoutesFor(ctx, reg, after) {
+					got[r.Asset] = r.Processor
+				}
+				if len(got) != 3 || got["usdc"] != "stripe" || got["usdp"] != "stripe" || got["usdg"] != "stripe" {
+					t.Fatalf("crypto routes = %v; want usdc, usdp, usdg via stripe only", got)
+				}
+			})
+		}
 	}
 }
