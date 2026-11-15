@@ -68,6 +68,8 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 	if org == nil || in.Subject == "" {
 		return nil, fault(401, "sign in to add funds", nil)
 	}
+	// A caller may name the bank debit "ach": the core speaks the policy's name for it.
+	in.Method = policyMethod(in.Method)
 	minCents, maxCents := topupBounds()
 	if in.AmountCents < minCents || in.AmountCents > maxCents {
 		return nil, fault(400, fmt.Sprintf("amountCents must be between %d and %d", minCents, maxCents), nil)
@@ -325,7 +327,7 @@ func CreateTopupIntent(c *zip.Ctx) error {
 	}
 	out, f := OpenTopupIntent(c.Context(), org, TopupIntentIn{
 		Subject: userBillingKey(c), Country: country, AmountCents: req.AmountCents,
-		Currency: strings.TrimSpace(req.Currency), Method: policyMethod(req.Method),
+		Currency: strings.TrimSpace(req.Currency), Method: req.Method,
 		IdempotencyKey: strings.TrimSpace(c.Header("X-Idempotency-Key")),
 		Payer:          PayerIn{Email: iamEmail(c)},
 	})

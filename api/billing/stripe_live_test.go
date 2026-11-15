@@ -1587,7 +1587,7 @@ func TestLiveStripe_ACHIsOfferedWithAutomaticVerificationAndWaitsForSettlement(t
 	l.call("POST", "/payment_intents/"+out.IntentID+"/cancel", nil)
 	if have["us_bank_account"] {
 		// A checkout for the bank debit alone offers that and nothing else.
-		only, f := OpenTopupIntent(*l.ctx, l.org, TopupIntentIn{Subject: l.subject, Country: "US", AmountCents: 2500, Method: "us_bank_account", IdempotencyKey: "ach-only-" + l.run})
+		only, f := OpenTopupIntent(*l.ctx, l.org, TopupIntentIn{Subject: l.subject, Country: "US", AmountCents: 2500, Method: "ach", IdempotencyKey: "ach-only-" + l.run})
 		if f != nil {
 			t.Fatalf("an ACH-only checkout: %v", f.Err)
 		}
