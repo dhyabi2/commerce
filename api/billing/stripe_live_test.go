@@ -1599,3 +1599,27 @@ func TestLiveStripe_ACHIsOfferedWithAutomaticVerificationAndWaitsForSettlement(t
 		l.call("POST", "/payment_intents/"+only.IntentID+"/cancel", nil)
 	}
 }
+
+// A buyer who backs out cancels their own unconfirmed top-up at Stripe, and the repeat is a no-op.
+func TestLiveStripe_ABuyerCancelsAnUnconfirmedTopup(t *testing.T) {
+	l := liveSetup(t)
+	out, f := OpenTopupIntent(*l.ctx, l.org, TopupIntentIn{Subject: l.subject, Country: "US", AmountCents: 2500, IdempotencyKey: "cancel-" + l.run})
+	if f != nil {
+		t.Fatalf("open: %v", f.Err)
+	}
+	for i := 0; i < 2; i++ {
+		got, f := CancelTopupIntent(*l.ctx, l.org, l.subject, out.IntentID)
+		if f != nil || got.State != "canceled" {
+			t.Fatalf("cancel %d = %+v %v", i, got, f)
+		}
+	}
+	if pi := l.call("GET", "/payment_intents/"+out.IntentID, nil); pi["status"] != "canceled" {
+		t.Fatalf("Stripe says %v; want canceled", pi["status"])
+	}
+	if p := mustIntent(t, out.IntentID); !p.Done {
+		t.Fatal("the cancelled payment still holds its place")
+	}
+	if _, f := CancelTopupIntent(*l.ctx, l.org, "hanzo/someone-else", out.IntentID); f == nil || f.Status != 404 {
+		t.Fatalf("another caller's cancel = %v; want 404", f)
+	}
+}
