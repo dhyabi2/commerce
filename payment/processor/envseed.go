@@ -27,18 +27,27 @@ type SeedSpec struct {
 	// deployment's own (Square and PayPal keep a live and a sandbox set side by side).
 	Deployment string
 	DeployWhen []string
+	// Shared are values of the deployment that every account of the processor may need and
+	// that the account has none of its own for (a testnet keeps one webhook secret): taken
+	// only beside a value the account has of its own, and never to make an account.
+	Shared []SeedField
+	// OnTestNetwork says the deployment is a test network, the only place a test or sandbox
+	// account may take a Shared value: a test-mode account never holds a live secret ref.
+	OnTestNetwork func(env map[string]string) bool
 }
 
 var Seeds = []SeedSpec{
 	{Processor: "stripe", ID: "live", Fields: []SeedField{
 		{"secretKey", []string{"STRIPE_SECRET_KEY"}, true}, {"webhook", []string{"STRIPE_WEBHOOK_SECRET"}, true}, {"publishableKey", []string{"STRIPE_PUBLISHABLE_KEY"}, false}}},
-	{Processor: "stripe", ID: "test", Fields: []SeedField{
-		{"secretKey", []string{"STRIPE_TEST_SECRET_KEY"}, true}, {"publishableKey", []string{"STRIPE_TEST_PUBLISHABLE_KEY"}, false}}},
+	{Processor: "stripe", ID: "test", OnTestNetwork: stripeTestKey, Shared: []SeedField{{"webhook", []string{"STRIPE_WEBHOOK_SECRET"}, true}}, Fields: []SeedField{
+		{"secretKey", []string{"STRIPE_TEST_SECRET_KEY"}, true}, {"webhook", []string{"STRIPE_TEST_WEBHOOK_SECRET"}, true}, {"publishableKey", []string{"STRIPE_TEST_PUBLISHABLE_KEY"}, false}}},
 	{Processor: "square", ID: "live", Deployment: "SQUARE_ENVIRONMENT", DeployWhen: []string{"", "production", "live"}, Fields: []SeedField{
 		{"accessToken", []string{"SQUARE_ACCESS_TOKEN"}, true}, {"locationId", []string{"SQUARE_LOCATION_ID"}, false}, {"applicationId", []string{"SQUARE_APPLICATION_ID"}, false},
 		{"webhookSignature", []string{"SQUARE_WEBHOOK_SIGNATURE_KEY"}, true}, {"webhookUrl", []string{"SQUARE_WEBHOOK_URL"}, false}}},
-	{Processor: "square", ID: "sandbox", Deployment: "SQUARE_ENVIRONMENT", DeployWhen: []string{"sandbox", "test"}, Fields: []SeedField{
-		{"accessToken", []string{"SQUARE_SANDBOX_ACCESS_TOKEN"}, true}, {"locationId", []string{"SQUARE_SANDBOX_LOCATION_ID"}, false}, {"applicationId", []string{"SQUARE_SANDBOX_APPLICATION_ID"}, false}}},
+	{Processor: "square", ID: "sandbox", Deployment: "SQUARE_ENVIRONMENT", DeployWhen: []string{"sandbox", "test"}, OnTestNetwork: func(env map[string]string) bool { return squareSandbox(env) }, Fields: []SeedField{
+		{"accessToken", []string{"SQUARE_SANDBOX_ACCESS_TOKEN"}, true}, {"locationId", []string{"SQUARE_SANDBOX_LOCATION_ID"}, false}, {"applicationId", []string{"SQUARE_SANDBOX_APPLICATION_ID"}, false},
+		{"webhookSignature", []string{"SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY"}, true}, {"webhookUrl", []string{"SQUARE_SANDBOX_WEBHOOK_URL"}, false}},
+		Shared: []SeedField{{"webhookSignature", []string{"SQUARE_WEBHOOK_SIGNATURE_KEY"}, true}, {"webhookUrl", []string{"SQUARE_WEBHOOK_URL"}, false}}},
 	{Processor: "paypal", ID: "live", Deployment: "PAYPAL_ENVIRONMENT", DeployWhen: []string{"", "production", "live"}, Fields: []SeedField{
 		{"clientId", []string{"PAYPAL_CLIENT_ID", "PAYPAL_LIVE_CLIENT_ID"}, false}, {"clientSecret", []string{"PAYPAL_CLIENT_SECRET", "PAYPAL_LIVE_CLIENT_SECRET"}, true},
 		{"applicationId", []string{"PAYPAL_APPLICATION_ID", "PAYPAL_LIVE_APPLICATION_ID"}, false}, {"webhookId", []string{"PAYPAL_WEBHOOK_ID", "PAYPAL_LIVE_WEBHOOK_ID"}, false}}},
@@ -55,6 +64,27 @@ var Seeds = []SeedSpec{
 		{"apiKey", []string{"COINBASE_COMMERCE_API_KEY"}, true}, {"webhook", []string{"COINBASE_COMMERCE_WEBHOOK_SECRET"}, true}}},
 	{Processor: "solanapay", ID: "default", Fields: []SeedField{
 		{"rpcUrl", []string{"SOLANA_RPC_URL"}, false}, {"recipient", []string{"SOLANA_RECIPIENT_ADDRESS"}, false}}},
+}
+
+// stripeTestKey says the deployment's own Stripe key is a test key: a test network.
+func stripeTestKey(env map[string]string) bool {
+	k := env["STRIPE_SECRET_KEY"]
+	if k == "" {
+		k = env["STRIPE_TEST_SECRET_KEY"]
+	}
+	return strings.HasPrefix(k, "sk_test_") || strings.HasPrefix(k, "rk_test_")
+}
+
+// squareSandbox says the deployment names Square's sandbox as its own.
+func squareSandbox(env map[string]string) bool {
+	n := strings.ToLower(strings.TrimSpace(env["SQUARE_ENVIRONMENT"]))
+	return n == "sandbox" || n == "test"
+}
+
+// SharedAllowed says the account may take the deployment's Shared values: on a test network
+// only.
+func (s SeedSpec) SharedAllowed(env map[string]string) bool {
+	return s.OnTestNetwork != nil && s.OnTestNetwork(env)
 }
 
 // Deploys says the environment names this account as the deployment's own.
