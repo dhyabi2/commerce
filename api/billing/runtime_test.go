@@ -980,3 +980,42 @@ func TestASeedFindsSecretsAtTheOrgRoot(t *testing.T) {
 		}
 	}
 }
+
+// The admin view's Kraken availability is the credential read the deposit rail makes: the
+// keys sealed at the org root make it available, and keys that do not read make it not.
+func TestKrakenAvailabilityFollowsTheDepositRailsCredentials(t *testing.T) {
+	ctx := heldStore(t)
+	installRuntime(t, ctx)
+	org := routingOrg(ctx, t)
+	t.Cleanup(func() { configureKraken(ctx, routing.Policy{}) })
+
+	pol := routing.Default()
+	setOn(&pol, "kraken", true)
+	pol.Accounts = []routing.Account{{Processor: "kraken", ID: "exchange", On: true, SecretRef: "/orgs/hanzo/commerce-secrets"}}
+	available := func() bool {
+		configureKraken(ctx, pol)
+		v, f := ReadRoutingView(ctx, org, "")
+		if f != nil {
+			t.Fatal(f.Err)
+		}
+		for _, s := range v.Processor {
+			if s.Processor == "kraken" {
+				return s.Available
+			}
+		}
+		t.Fatal("the view lists no kraken")
+		return false
+	}
+
+	useSecrets(t, mapSecrets{})
+	if available() {
+		t.Fatal("kraken is available with no credentials")
+	}
+	useSecrets(t, mapSecrets{
+		"/orgs/hanzo/commerce-secrets/KRAKEN_API_KEY":    "key",
+		"/orgs/hanzo/commerce-secrets/KRAKEN_API_SECRET": "c2VjcmV0", // base64, as Kraken issues it
+	})
+	if !available() {
+		t.Fatal("kraken is not available though its credentials read at the org root")
+	}
+}
