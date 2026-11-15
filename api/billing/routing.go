@@ -816,7 +816,7 @@ func place(ctx context.Context, org *organization.Organization, in RouteIn, live
 		}
 		d.Quote = q
 	}
-	d.Alternatives = alternativesFor(ctx, org, reg, pol, country)
+	d.Alternatives = alternativesFor(ctx, org, reg, pol, country, pol.CheckoutCurrency(country, firstNonEmpty(in.QuoteCurrency, in.Currency)))
 	d.Crypto = cryptoRoutesFor(ctx, reg, pol)
 	d.LocalCurrency, d.Version = pol.LocalCurrency(country), polVersion
 	if live {
@@ -868,7 +868,7 @@ var cryptoServes = func(ctx context.Context) bool {
 // alternativesFor are the other ways a buyer in country may pay, beyond the card
 // slot: PayPal wherever PayPal operates and the deployment allows it and the policy
 // has it on, and native crypto where a deposit watcher is really running.
-func alternativesFor(ctx context.Context, org *organization.Organization, reg *processor.Registry, pol routing.Policy, country string) []string {
+func alternativesFor(ctx context.Context, org *organization.Organization, reg *processor.Registry, pol routing.Policy, country, cur string) []string {
 	alt := []string{}
 	if pol.On(processor.PayPal) && payment.IsPayPalCountry(country) && !processor.DisabledByPolicy(processor.PayPal) {
 		if p, err := reg.Registered(processor.PayPal); err == nil && p.IsAvailable(ctx) {
@@ -878,7 +878,7 @@ func alternativesFor(ctx context.Context, org *organization.Organization, reg *p
 	if pol.On(routing.CryptoRail) && ((pol.StripeCrypto() && stripeStablecoins(ctx, reg).On) || cryptoServes(ctx)) {
 		alt = append(alt, "crypto")
 	}
-	alt = append(alt, bankAlternatives(ctx, org, reg, pol, country)...)
+	alt = append(alt, bankAlternatives(ctx, org, reg, pol, country, cur)...)
 	return alt
 }
 
@@ -1193,17 +1193,18 @@ func RestoreRoutingHandler(c *zip.Ctx) error {
 	return c.JSON(200, p)
 }
 
-// bankAlternatives are the bank payments offered to a buyer in country: "ach" and the local
+// bankAlternatives are the bank payments offered to a buyer in country paying in cur, each only
+// in its own countries and currency: "ach" and the local
 // bank methods Stripe takes there, each only where the account's capability for it is active
 // and the policy has it on, and "wire" where the org holds receiving details.
-func bankAlternatives(ctx context.Context, org *organization.Organization, reg *processor.Registry, pol routing.Policy, country string) []string {
+func bankAlternatives(ctx context.Context, org *organization.Organization, reg *processor.Registry, pol routing.Policy, country, cur string) []string {
 	var out []string
 	if pol.On(processor.Stripe) {
 		if p, err := reg.Registered(processor.Stripe); err == nil && p.IsAvailable(ctx) {
 			if c, ok := p.(processor.Capable); ok {
 				have := c.Methods(ctx)
 				for _, m := range routing.BankMethods(country) {
-					if !have[m] || !pol.MethodOn(m) {
+					if !have[m] || !pol.MethodOn(m) || !routing.MethodViable(m, cur) {
 						continue
 					}
 					if m == "us_bank_account" {

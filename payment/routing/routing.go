@@ -410,7 +410,7 @@ func in(list []string, v string) bool {
 var MethodCurrencies = map[string][]string{
 	"pix": {"brl"}, "boleto": {"brl"}, "oxxo": {"mxn"}, "ideal": {"eur"}, "bancontact": {"eur"}, "sepa_debit": {"eur"},
 	"p24": {"pln", "eur"}, "blik": {"pln"}, "eps": {"eur"}, "paynow": {"sgd"}, "promptpay": {"thb"}, "grabpay": {"sgd", "myr", "php"},
-	"us_bank_account": {"usd"}, "acss_debit": {"cad", "usd"}, "bacs_debit": {"gbp"}, "au_becs_debit": {"aud"},
+	"us_bank_account": {"usd"}, "acss_debit": {"cad"}, "bacs_debit": {"gbp"}, "au_becs_debit": {"aud"},
 	"upi": {"inr"}, "kakao_pay": {"krw"}, "naver_pay": {"krw"}, "payco": {"krw"}, "samsung_pay": {"krw"}, "kr_card": {"krw"},
 	"wechat_pay": {"cny", "usd"}, "twint": {"chf"}, "swish": {"sek"}, "mobilepay": {"dkk", "eur"}, "multibanco": {"eur"}, "fpx": {"myr"},
 }
@@ -1235,11 +1235,12 @@ func BankMethods(country string) []string {
 	return out
 }
 
-// sepaCountries are the countries whose banks take SEPA Direct Debit from Stripe.
+// sepaCountries are the countries of the European Economic Area, whose banks take SEPA Direct
+// Debit from Stripe, in euros.
 var sepaCountries = map[string]bool{
 	"AT": true, "BE": true, "BG": true, "HR": true, "CY": true, "CZ": true, "DK": true, "EE": true, "FI": true, "FR": true,
 	"DE": true, "GR": true, "HU": true, "IE": true, "IT": true, "LV": true, "LT": true, "LU": true, "MT": true, "NL": true,
-	"PL": true, "PT": true, "RO": true, "SK": true, "SI": true, "ES": true, "SE": true, "CH": true, "GB": true, "NO": true, "IS": true, "LI": true,
+	"PL": true, "PT": true, "RO": true, "SK": true, "SI": true, "ES": true, "SE": true, "NO": true, "IS": true, "LI": true,
 }
 
 // DelayedMethod says a method settles after the buyer has left: a bank debit (days), a voucher or a
@@ -1261,4 +1262,16 @@ const ACHMaxCents = 500000
 // account (every method BankMethods can name).
 func BankMethodNames() []string {
 	return []string{"us_bank_account", "acss_debit", "bacs_debit", "au_becs_debit", "sepa_debit", "ideal", "bancontact", "blik", "p24", "eps", "pix", "upi", "fpx", "multibanco"}
+}
+
+// CheckoutCurrency is the currency a checkout in country is in when the buyer chose none: the
+// country's own when local currencies are on, else dollars.
+func (p Policy) CheckoutCurrency(country, explicit string) string {
+	if c := strings.ToLower(strings.TrimSpace(explicit)); c != "" {
+		return c
+	}
+	if !p.LocalOn {
+		return "usd"
+	}
+	return p.LocalCurrency(country)
 }
