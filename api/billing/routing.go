@@ -993,7 +993,7 @@ func ReadRoutingView(ctx context.Context, org *organization.Organization, scope 
 	}
 	v.Eligibility, _ = eligibility(ctx, registryFor(ctx, scope))
 	v.Brands, v.Methods, v.MethodNotes = routing.Brands, routing.MethodNames, routing.MethodNotes
-	v.Problems = chargeProblems(ctx, pol)
+	v.Problems = append(chargeProblems(ctx, pol), settlementProblems(ctx, pol)...)
 	if v.Problems == nil {
 		v.Problems = []string{}
 	}

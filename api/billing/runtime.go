@@ -166,6 +166,42 @@ func chargeProblems(ctx context.Context, pol routing.Policy) []string {
 	return problems
 }
 
+// settlementFields are the secrets a processor needs to CONFIRM a payment it took (its webhook
+// signature): without one the money can be taken but credits cannot be confirmed.
+var settlementFields = map[string][]string{
+	"stripe": {"webhook"},
+	"square": {"webhookSignature"},
+}
+
+// settlementPrefix marks a problem of the settlement kind, distinct from an unchargeable one.
+const settlementPrefix = "settlement: "
+
+// settlementProblems says, for each on-processor that can charge, which settlement secret does
+// not resolve, with the ref and why. It never makes the processor unavailable: charging still
+// works, so these do not count in canCharge and do not raise routing.unchargeable.
+func settlementProblems(ctx context.Context, pol routing.Policy) []string {
+	var out []string
+	for _, r := range pol.Processors {
+		if !r.On {
+			continue
+		}
+		for _, a := range pol.Accounts {
+			if a.Processor != r.Processor || !a.On || a.Network != "" || len(accountReasons(ctx, a)) > 0 {
+				continue
+			}
+			for _, name := range settlementFields[a.Processor] {
+				ref := routing.Get(a.Secrets, name)
+				if ref == "" {
+					out = append(out, settlementPrefix+a.Processor+" account "+a.ID+" has no KMS path for "+name+": charges are taken but credits cannot be confirmed")
+				} else if d := secrets.Diagnose(ctx, ref); d != "" {
+					out = append(out, settlementPrefix+a.Processor+" account "+a.ID+" "+name+" at "+ref+": "+d+": charges are taken but credits cannot be confirmed")
+				}
+			}
+		}
+	}
+	return out
+}
+
 // canCharge says some processor that is on has an account that resolves.
 func canCharge(ctx context.Context, pol routing.Policy) bool {
 	for _, p := range chargeProblems(ctx, pol) {
@@ -183,7 +219,7 @@ var lastProblems atomic.Value // string
 // reportUnchargeableOnChange reports when the set of problems differs from the last one
 // reported, and says so once it clears.
 func reportUnchargeableOnChange(ctx context.Context, pol routing.Policy) {
-	now := strings.Join(chargeProblems(ctx, pol), "\n")
+	now := strings.Join(append(chargeProblems(ctx, pol), settlementProblems(ctx, pol)...), "\n")
 	if prev, _ := lastProblems.Load().(string); prev == now {
 		return
 	}
@@ -196,6 +232,11 @@ func reportUnchargeableOnChange(ctx context.Context, pol routing.Policy) {
 }
 
 func reportUnchargeable(ctx context.Context, pol routing.Policy) {
+	if sp := settlementProblems(ctx, pol); len(sp) > 0 {
+		log.Error("ALARM: the platform routing policy cannot confirm what it charges: %s", strings.Join(sp, "; "))
+		_, _ = engine.EmitBillingEvent(webhookGuardDB(ctx), "routing.unsettleable", "routing", routingpolicy.Platform, "",
+			map[string]interface{}{"problems": sp}, nil)
+	}
 	problems := chargeProblems(ctx, pol)
 	if len(problems) == 0 {
 		return

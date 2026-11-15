@@ -765,3 +765,27 @@ func TestATestnetSeedDerivesEveryRefFromTheNetworksRoot(t *testing.T) {
 		t.Fatalf("the key resolves under /cloud: %s", p)
 	}
 }
+
+// A missing webhook secret is a problem of its own kind: Stripe stays available (the money can
+// be taken) and the policy stays chargeable, but credits cannot be confirmed.
+func TestAMissingWebhookSecretIsASettlementProblemAndNotUnchargeable(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{"/cloud/STRIPE_SECRET_KEY": "k"})
+	pol := routing.Default()
+	for i := range pol.Processors {
+		pol.Processors[i].On = pol.Processors[i].Processor == "stripe"
+	}
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{
+		{Name: "secretKey", Value: "/cloud/STRIPE_SECRET_KEY"}, {Name: "webhook", Value: "/cloud/STRIPE_WEBHOOK_SECRET"}}}}
+	if got := chargeProblems(ctx, pol); len(got) != 0 || !canCharge(ctx, pol) {
+		t.Fatalf("a missing webhook secret made the policy unchargeable: %v", got)
+	}
+	sp := settlementProblems(ctx, pol)
+	if len(sp) != 1 || !strings.HasPrefix(sp[0], "settlement: ") || !strings.Contains(sp[0], "/cloud/STRIPE_WEBHOOK_SECRET: reader error: no such secret") {
+		t.Fatalf("settlement problems = %v", sp)
+	}
+	secrets.Set(mapSecrets{"/cloud/STRIPE_SECRET_KEY": "k", "/cloud/STRIPE_WEBHOOK_SECRET": "w"})
+	if sp := settlementProblems(ctx, pol); len(sp) != 0 {
+		t.Fatalf("resolved, still reported: %v", sp)
+	}
+}
