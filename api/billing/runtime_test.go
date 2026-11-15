@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -844,17 +845,17 @@ func TestASeedOfTestnetChargeAccountsTakesCardsAndValidates(t *testing.T) {
 // that validates, and nothing the admin set overwritten. The fixtures hold no values.
 func TestTheTopUpRunsOnTheAdminWrittenPoliciesLiveOnProdAndTestnet(t *testing.T) {
 	for _, fx := range []struct {
-		name, root string
-		version    int
-		seeded     bool
-		level      bool
+		name, root, file string
+		version          int
+		seeded           bool
+		level            bool
 	}{
-		{"prod v3, seeded flag, no level", "/commerce-secrets", 3, true, false},
-		{"prod v3, seeded flag and level 2", "/commerce-secrets", 3, true, true},
-		{"prod v3, no seeded flag", "/commerce-secrets", 3, false, false},
-		{"testnet v11, seeded flag, no level", "/cloud", 11, true, false},
-		{"testnet v11, seeded flag and level 2", "/cloud", 11, true, true},
-		{"testnet v11, no seeded flag", "/cloud", 11, false, false},
+		{"prod v3, seeded flag, no level", "/commerce-secrets", "policy-prod-v3.json", 3, true, false},
+		{"prod v3, seeded flag and level 2", "/commerce-secrets", "policy-prod-v3.json", 3, true, true},
+		{"prod v3, no seeded flag", "/commerce-secrets", "policy-prod-v3.json", 3, false, false},
+		{"testnet v11, seeded flag, no level", "/cloud", "policy-testnet-v11.json", 11, true, false},
+		{"testnet v11, seeded flag and level 2", "/cloud", "policy-testnet-v11.json", 11, true, true},
+		{"testnet v11, no seeded flag", "/cloud", "policy-testnet-v11.json", 11, false, false},
 	} {
 		t.Run(fx.name, func(t *testing.T) {
 			ctx := heldStore(t)
@@ -868,13 +869,19 @@ func TestTheTopUpRunsOnTheAdminWrittenPoliciesLiveOnProdAndTestnet(t *testing.T)
 				fx.root + "/STRIPE_SECRET_KEY": "v", fx.root + "/STRIPE_WEBHOOK_SECRET": "v",
 				fx.root + "/SQUARE_ACCESS_TOKEN": "v", fx.root + "/PAYPAL_CLIENT_SECRET": "v",
 			})
-			// The admin's policy: processors on, no accounts, an admin-set rule to keep.
-			old := routing.Default()
-			for _, n := range []string{"stripe", "square", "paypal"} {
-				setOn(&old, n, true)
+			// The policy as the admin routing GET returned it live (testdata, refs and paths only).
+			raw, err := os.ReadFile("testdata/" + fx.file)
+			if err != nil {
+				t.Fatal(err)
 			}
-			old.Accounts = []routing.Account{}
-			old.Fallback = []string{"stripe", "square"}
+			var old routing.Policy
+			if err := json.Unmarshal(raw, &old); err != nil {
+				t.Fatal(err)
+			}
+			if len(old.Accounts) != 0 {
+				t.Fatal("the live fixture holds accounts")
+			}
+			wantFallback := append([]string(nil), old.Fallback...)
 			row := policyRow(old.Normal(), "z@hanzo.ai", fx.version)
 			var m map[string]json.RawMessage
 			_ = json.Unmarshal([]byte(row.Rules), &m)
@@ -930,8 +937,8 @@ func TestTheTopUpRunsOnTheAdminWrittenPoliciesLiveOnProdAndTestnet(t *testing.T)
 			if got := chargeProblems(ctx, after); len(got) != 0 {
 				t.Fatalf("problems after the top-up: %v", got)
 			}
-			if len(after.Fallback) != 2 || after.Fallback[0] != "stripe" {
-				t.Fatalf("the admin's fallback was overwritten: %v", after.Fallback)
+			if strings.Join(after.Fallback, ",") != strings.Join(wantFallback, ",") {
+				t.Fatalf("the admin's fallback was overwritten: %v -> %v", wantFallback, after.Fallback)
 			}
 			if err := seedRuntime(ctx); err != nil {
 				t.Fatal(err)

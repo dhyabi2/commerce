@@ -1,0 +1,86 @@
+{
+  "processors": [
+    {
+      "processor": "square",
+      "on": true,
+      "weight": 50
+    },
+    {
+      "processor": "stripe",
+      "on": true,
+      "weight": 50
+    },
+    {
+      "processor": "paypal",
+      "on": true,
+      "weight": 0
+    },
+    {
+      "processor": "crypto",
+      "on": true,
+      "weight": 0
+    },
+    {
+      "processor": "kraken",
+      "on": false,
+      "weight": 0
+    },
+    {
+      "processor": "mpc",
+      "on": false,
+      "weight": 0
+    }
+  ],
+  "accounts": null,
+  "cryptoRails": [
+    {
+      "asset": "usdc",
+      "processor": "stripe"
+    },
+    {
+      "asset": "usdp",
+      "processor": "stripe"
+    },
+    {
+      "asset": "usdg",
+      "processor": "stripe"
+    },
+    {
+      "asset": "btc",
+      "processor": "kraken"
+    },
+    {
+      "asset": "eth",
+      "processor": "kraken"
+    },
+    {
+      "asset": "sol",
+      "processor": "kraken"
+    },
+    {
+      "asset": "usdt",
+      "processor": "kraken"
+    },
+    {
+      "asset": "*",
+      "processor": "kraken"
+    },
+    {
+      "asset": "*",
+      "processor": "mpc"
+    }
+  ],
+  "localOn": true,
+  "sticky": true,
+  "currencyRules": null,
+  "countryRules": null,
+  "brandRules": null,
+  "issuerCountryRules": null,
+  "fxSource": "processor",
+  "fxFee": "pass",
+  "noRounding": false,
+  "roundingIncrements": null,
+  "localCurrencies": null,
+  "fallback": null,
+  "methods": null
+}
