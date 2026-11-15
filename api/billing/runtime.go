@@ -315,16 +315,21 @@ func configureKraken(ctx context.Context, pol routing.Policy) {
 func StartRuntimeRefresh() (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		t := time.NewTicker(runtimeRefresh)
+		// While anything fails to read, retry on a backoff (1s doubling to runtimeRefresh) so one
+		// failed read at boot does not stick; healthy, read every runtimeRefresh.
+		wait := time.Second
+		t := time.NewTimer(wait)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				next := runtimeRefresh
 				pol, v, err := ReadRoutingVersioned(ctx, "")
 				if err != nil {
 					log.Warn("routing: the platform policy could not be reread: %v", err)
+					t.Reset(runtimeRefresh)
 					continue
 				}
 				if int64(v) != appliedVersion.Load() {
@@ -339,6 +344,15 @@ func StartRuntimeRefresh() (stop func()) {
 					runtimeMu.Unlock()
 				}
 				reportUnchargeableOnChange(ctx, pol)
+				if len(chargeProblems(ctx, pol)) > 0 {
+					if wait *= 2; wait > runtimeRefresh {
+						wait = runtimeRefresh
+					}
+					next = wait
+				} else {
+					wait = time.Second
+				}
+				t.Reset(next)
 			}
 		}
 	}()

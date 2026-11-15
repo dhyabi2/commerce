@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -668,4 +669,71 @@ func (f failingSecrets) GetSecret(_ context.Context, ref string) ([]byte, error)
 		return nil, err
 	}
 	return nil, nil
+}
+
+// flakySecrets fails the first n reads of each path with err, then answers.
+type flakySecrets struct {
+	mu    sync.Mutex
+	fails int
+	err   error
+	seen  map[string]int
+}
+
+func (f *flakySecrets) GetSecret(_ context.Context, ref string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.seen == nil {
+		f.seen = map[string]int{}
+	}
+	f.seen[ref]++
+	if f.seen[ref] <= f.fails {
+		return nil, f.err
+	}
+	return []byte("value"), nil
+}
+
+// A reader that fails once and then succeeds ends available once the policy is re-read;
+// one that always fails ends in problems with the ref and the reason, and never a value.
+func TestAReaderThatFailsOnceEndsAvailableAndOneThatAlwaysFailsEndsInProblems(t *testing.T) {
+	ctx := context.Background()
+	pol := routing.Default()
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}}}
+	for _, p := range []string{"square", "paypal"} {
+		for i := range pol.Processors {
+			if pol.Processors[i].Processor == p {
+				pol.Processors[i].On = false
+			}
+		}
+	}
+	t.Cleanup(func() { secrets.Set(nil); processor.SetAccounts(processor.Stripe, nil) })
+
+	key := func() string { a, _ := processor.FirstAccount(processor.Stripe); return a.Secret("secretKey") }
+
+	// Fails once, then succeeds: unavailable after the boot read, available after the re-read.
+	secrets.Set(&flakySecrets{fails: 1, err: secrets.ErrTimeout})
+	applyAccounts(ctx, pol)
+	if key() != "" || secrets.Failure("/commerce-secrets/STRIPE_SECRET_KEY") != "timeout" {
+		t.Fatalf("the boot read should have failed and been recorded: key=%q failure=%q", key(), secrets.Failure("/commerce-secrets/STRIPE_SECRET_KEY"))
+	}
+	applyAccounts(ctx, pol) // the periodic re-read
+	if key() != "value" {
+		t.Fatal("the re-read did not pick the secret up")
+	}
+	if p := chargeProblems(ctx, pol); len(p) != 0 {
+		t.Fatalf("problems after the secret resolved: %v", p)
+	}
+	if secrets.Failure("/commerce-secrets/STRIPE_SECRET_KEY") != "" {
+		t.Fatal("the failure was not cleared")
+	}
+
+	secrets.Set(&flakySecrets{fails: 1 << 30, err: secrets.ErrDenied})
+	applyAccounts(ctx, pol)
+	applyAccounts(ctx, pol)
+	p := strings.Join(chargeProblems(ctx, pol), "\n")
+	if !strings.Contains(p, "/commerce-secrets/STRIPE_SECRET_KEY: permission denied") || strings.Contains(p, "value") {
+		t.Fatalf("an always-failing reader must end in problems naming ref and reason: %s", p)
+	}
+	if secrets.Failure("/commerce-secrets/STRIPE_SECRET_KEY") != "permission denied" || key() != "" {
+		t.Fatal("the failure was not recorded or the key is set")
+	}
 }
