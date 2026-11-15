@@ -2,6 +2,8 @@ package billing
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -221,5 +223,55 @@ func TestWireReconcileIsIdempotentAndAudited(t *testing.T) {
 	// Credited, the reference is spent: the next wire gets a new one.
 	if next, _ := openWireReference(org, "buyer"); next == ref {
 		t.Fatal("a credited wire's reference was handed out again")
+	}
+}
+
+// Every bank method is listed only to buyers in its own countries paying in its own currency:
+// ACH to the US in dollars, SEPA to the EEA in euros, Pix to Brazil in reais, and so on. The
+// currency is the one the buyer chose, else their country's own.
+func TestEachBankMethodIsListedOnlyInItsOwnCountriesAndCurrency(t *testing.T) {
+	ctx := context.Background()
+	all := map[string]bool{}
+	for _, m := range routing.BankMethodNames() {
+		all[m] = true
+	}
+	reg := processor.NewRegistry(processor.DefaultConfig())
+	reg.Register(&capableStripe{stripeDouble: stripeDouble{}, have: all})
+	pol := routing.Default()
+	for _, tc := range []struct {
+		country, cur string // cur "" is the country's own
+		want         string // sorted, comma-joined
+	}{
+		{"US", "", "ach"}, {"US", "usd", "ach"}, {"US", "eur", ""}, {"US", "cad", ""},
+		{"DE", "", "sepa_debit"}, {"DE", "eur", "sepa_debit"}, {"DE", "usd", ""},
+		{"IN", "", "upi"}, {"IN", "inr", "upi"}, {"IN", "usd", ""}, {"IN", "eur", ""},
+		{"BR", "", "pix"}, {"BR", "brl", "pix"}, {"BR", "usd", ""},
+		{"NL", "", "ideal,sepa_debit"}, {"NL", "usd", ""},
+		{"BE", "", "bancontact,sepa_debit"}, {"BE", "usd", ""},
+		{"PL", "", "blik,p24"}, {"PL", "eur", "p24,sepa_debit"}, {"PL", "usd", ""},
+		{"AT", "", "eps,sepa_debit"}, {"AT", "usd", ""},
+		{"PT", "", "multibanco,sepa_debit"}, {"PT", "usd", ""},
+		{"CA", "", "acss_debit"}, {"CA", "cad", "acss_debit"}, {"CA", "usd", ""},
+		{"FR", "", "sepa_debit"}, {"IE", "", "sepa_debit"}, {"NO", "eur", "sepa_debit"},
+		{"GB", "", "bacs_debit"}, {"GB", "eur", ""}, {"AU", "", "au_becs_debit"}, {"MY", "", "fpx"},
+		// Outside every one of them.
+		{"SE", "", ""}, {"SE", "eur", "sepa_debit"}, {"CH", "", ""}, {"CH", "eur", ""}, {"JP", "", ""}, {"MX", "", ""}, {"ZA", "", ""},
+	} {
+		got := []string{}
+		for _, a := range bankAlternatives(ctx, nil, reg, pol, tc.country, pol.CheckoutCurrency(tc.country, tc.cur)) {
+			if a != "wire" {
+				got = append(got, a)
+			}
+		}
+		sort.Strings(got)
+		if g := strings.Join(got, ","); g != tc.want {
+			t.Errorf("%s paying in %q: listed %q; want %q", tc.country, tc.cur, g, tc.want)
+		}
+	}
+	// A method the account cannot take is not listed, in its own country.
+	off := processor.NewRegistry(processor.DefaultConfig())
+	off.Register(&capableStripe{stripeDouble: stripeDouble{}, have: map[string]bool{}})
+	if got := bankAlternatives(ctx, nil, off, pol, "US", "usd"); len(got) != 0 {
+		t.Errorf("a US buyer on an account with no bank capability is offered %v", got)
 	}
 }
