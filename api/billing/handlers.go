@@ -331,6 +331,25 @@ func Route(r *zip.Group, args ...zip.Handler) {
 	user.Raw(http.MethodPost, "/topup/intent", CreateTopupIntent)
 	user.Raw(http.MethodGet, "/topup/intent/:id", GetTopupIntent)
 
+	// Stablecoins through Stripe, headless: where to send them. Nothing here credits.
+	user.Raw(http.MethodPost, "/topup/crypto", CreateCryptoTopup)
+
+	// The headless purchase surface: a checkout an agent creates, updates and completes in
+	// JSON, paid with a shared payment token or a stablecoin deposit, and the order it
+	// confirms. A renewal an agent's token cannot cover is paid with a fresh token.
+	user.Raw(http.MethodPost, "/checkouts", CreateAgentCheckout)
+	user.Raw(http.MethodGet, "/checkouts/:id", GetAgentCheckout)
+	user.Raw(http.MethodPatch, "/checkouts/:id", UpdateAgentCheckout)
+	user.Raw(http.MethodPost, "/checkouts/:id/complete", CompleteAgentCheckout)
+	user.Raw(http.MethodGet, "/orders/:id", GetAgentOrder)
+	user.Raw(http.MethodPost, "/invoices/:id/agent-token", SupplyAgentToken)
+
+	// What is for sale, in dollars, and how an agent buys it. Public: an agent reads it
+	// before it has a token.
+	open := r.Group("billing")
+	open.Raw(http.MethodGet, "/catalog", middleware.CachePublic(300), GetBillingCatalog)
+	open.Raw(http.MethodGet, "/discovery", middleware.CachePublic(300), GetBillingDiscovery)
+
 	// Wire + crypto top-up rails (user-scoped; nothing here mints — a wire
 	// settles via the admin wire/credit verb on bank receipt, a crypto deposit
 	// via the chain watcher on confirmations).

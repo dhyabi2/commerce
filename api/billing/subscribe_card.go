@@ -1933,6 +1933,9 @@ func chargeProvider(org *organization.Organization, buyerPresent bool) engine.Pr
 			return "", fmt.Errorf("subscription %s not found: %w", inv.SubscriptionId, err)
 		}
 		if strings.TrimSpace(sub.DefaultPaymentMethod) == "" {
+			// A subscription bought on a one-time token has no method to renew on: the agent is
+			// told how to supply one.
+			announceTokenRenewal(ctx, sub, invoiceRef{ID: inv.Id(), Cents: amountCents}, "no_payment_method", "the subscription holds no payment method to renew on")
 			return "", fmt.Errorf("subscription %s has no default payment method", sub.Id())
 		}
 		pm := paymentmethod.New(db)
@@ -2013,6 +2016,14 @@ func chargeProvider(org *organization.Organization, buyerPresent bool) engine.Pr
 			}
 		}
 		if err != nil || res == nil || !res.Success {
+			if pm.Type == agentToken {
+				// A token that cannot cover the renewal (expired, revoked, over its limit, or not
+				// recurring) leaves the invoice open and the subscription past due, and says how
+				// an agent keeps it.
+				if code, why := tokenCode(res, err); code != "" {
+					announceTokenRenewal(ctx, sub, invoiceRef{ID: inv.Id(), Cents: amountCents}, code, why)
+				}
+			}
 			return "", fmt.Errorf("%s", parseCardDeclineReason(res, err))
 		}
 		if err := paymentorg.Put(res.ProcessorRef, org.Name, inv.UserId, inv.Id(), 0, org.TestMode()); err != nil {

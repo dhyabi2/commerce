@@ -264,9 +264,8 @@ func TestAPolicyNeedsKnownDistinctProcessorsAndRealAccounts(t *testing.T) {
 	}
 }
 
-func TestCryptoRailsPutUSDCOnStripeAndBTCOnKrakenAndTheOrderIsThePolicys(t *testing.T) {
+func TestCryptoIsStripeStablecoinsOnlyUntilTheAdminAddsRails(t *testing.T) {
 	p := Default()
-	switchOn(&p, processor.Kraken)
 	first := func(asset string) processor.ProcessorType {
 		procs := p.CryptoProcessors(asset, nil)
 		if len(procs) == 0 {
@@ -274,20 +273,27 @@ func TestCryptoRailsPutUSDCOnStripeAndBTCOnKrakenAndTheOrderIsThePolicys(t *test
 		}
 		return procs[0]
 	}
-	if first("usdc") != processor.Stripe || first("btc") != processor.Kraken {
-		t.Fatalf("usdc %s, btc %s; want stripe and kraken", first("usdc"), first("btc"))
+	for _, a := range []string{"usdc", "usdp", "usdg"} {
+		if first(a) != processor.Stripe {
+			t.Fatalf("%s goes to %q; want stripe", a, first(a))
+		}
+	}
+	// Nothing else is offered by default, whatever is switched on: no rail names it.
+	switchOn(&p, processor.Kraken)
+	switchOn(&p, processor.MPC)
+	for _, a := range []string{"btc", "eth", "sol", "usdt", "doge"} {
+		if got := p.CryptoProcessors(a, nil); len(got) != 0 {
+			t.Fatalf("%s goes to %v by default; want nothing", a, got)
+		}
 	}
 	if !p.StripeCrypto() {
 		t.Fatal("Stripe leads for USDC and its crypto is not offered")
 	}
-	// Kraken ahead of Stripe for USDC: the next attempt follows, and the Payment Element is told to drop crypto.
-	p.CryptoRails = append([]CryptoRoute{{"usdc", string(processor.Kraken)}}, p.CryptoRails...)
-	if first("usdc") != processor.Kraken || p.StripeCrypto() {
-		t.Fatalf("after the flip usdc is on %s, stripe crypto %v", first("usdc"), p.StripeCrypto())
-	}
-	// A processor that is off is skipped: MPC self-custody is off by default.
-	if procs := p.CryptoProcessors("doge", nil); len(procs) != 1 || procs[0] != processor.Kraken {
-		t.Fatalf("doge goes to %v; want kraken alone (mpc is off)", procs)
+	// The admin adds Kraken for BTC, and puts it ahead of Stripe for USDC: the next attempt
+	// follows, and the Payment Element is told to drop crypto.
+	p.CryptoRails = append([]CryptoRoute{{"usdc", string(processor.Kraken)}, {"btc", string(processor.Kraken)}}, p.CryptoRails...)
+	if first("btc") != processor.Kraken || first("usdc") != processor.Kraken || p.StripeCrypto() {
+		t.Fatalf("after the admin's rails usdc is on %s, btc on %s, stripe crypto %v", first("usdc"), first("btc"), p.StripeCrypto())
 	}
 }
 
