@@ -41,6 +41,7 @@ type Config struct {
 // Provider implements PaymentProcessor, SubscriptionProcessor, and CustomerProcessor.
 type Provider struct {
 	*processor.BaseProcessor
+	crypto         cryptoCache
 	keys           sync.RWMutex // guards the three below, which the policy's account changes
 	secretKey      string
 	publishableKey string
@@ -156,6 +157,10 @@ func (p *Provider) Charge(ctx context.Context, req processor.PaymentRequest) (*p
 		if processor.Sanctioned(card.Country) {
 			return &processor.PaymentResult{Success: false, ErrorMessage: errSanctioned.Error(), Error: errSanctioned}, errSanctioned
 		}
+	}
+
+	if isToken(req.Token) {
+		return p.chargeToken(ctx, req)
 	}
 
 	params := url.Values{}

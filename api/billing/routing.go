@@ -205,6 +205,9 @@ func quoteFor(ctx context.Context, reg *processor.Registry, pol routing.Policy, 
 // processor's rate is then locked for it, and the quote names the lock.
 func quoteVia(ctx context.Context, reg *processor.Registry, pol routing.Policy, via processor.ProcessorType, amountCents int64, country, explicit, method string, bind bool) (*routing.Quote, *PaymentFault) {
 	cur := strings.ToLower(strings.TrimSpace(explicit))
+	if cur == "" && strings.EqualFold(method, "crypto") {
+		cur = "usd" // stablecoin payments are presented in USD only
+	}
 	if cur == "" {
 		cur = pol.LocalCurrency(country)
 		if cur != "usd" && !takesCurrency(ctx, reg, via, cur) {
@@ -872,7 +875,7 @@ func alternativesFor(ctx context.Context, org *organization.Organization, reg *p
 			alt = append(alt, "paypal")
 		}
 	}
-	if pol.On(routing.CryptoRail) && (pol.StripeCrypto() || cryptoServes(ctx)) {
+	if pol.On(routing.CryptoRail) && ((pol.StripeCrypto() && stripeStablecoins(ctx, reg).On) || cryptoServes(ctx)) {
 		alt = append(alt, "crypto")
 	}
 	alt = append(alt, bankAlternatives(ctx, org, reg, pol, country)...)
@@ -883,15 +886,15 @@ func alternativesFor(ctx context.Context, org *organization.Organization, reg *p
 // takes it now: the first the rails list that is on and able. Stripe is able when it is
 // registered and available (its Payment Element offers crypto on a dollar intent);
 // the custody and exchange processors are able when something is watching deposits.
-func cryptoRoutesFor(ctx context.Context, reg *processor.Registry, pol routing.Policy) []routing.CryptoRoute {
-	out := []routing.CryptoRoute{}
+func cryptoRoutesFor(ctx context.Context, reg *processor.Registry, pol routing.Policy) []routing.CryptoOffer {
+	out := []routing.CryptoOffer{}
 	if !pol.On(routing.CryptoRail) {
 		return out
 	}
+	stripe := stripeStablecoins(ctx, reg)
 	able := func(t processor.ProcessorType) bool {
 		if t == processor.Stripe {
-			p, err := reg.Registered(processor.Stripe)
-			return err == nil && p.IsAvailable(ctx)
+			return stripe.On
 		}
 		return len(watchedAssets()) > 0
 	}
@@ -902,7 +905,11 @@ func cryptoRoutesFor(ctx context.Context, reg *processor.Registry, pol routing.P
 		}
 		seen[r.Asset] = true
 		if procs := pol.CryptoProcessors(r.Asset, able); len(procs) > 0 {
-			out = append(out, routing.CryptoRoute{Asset: r.Asset, Processor: string(procs[0])})
+			o := routing.CryptoOffer{Asset: r.Asset, Processor: string(procs[0]), Currency: "usd"}
+			if procs[0] == processor.Stripe {
+				o.Networks = stripe.Networks // Stripe's deposit mode, and USD only
+			}
+			out = append(out, o)
 		}
 	}
 	return out
@@ -1218,4 +1225,19 @@ func wireConfigured(ctx context.Context, org *organization.Organization) bool {
 	recv := *org
 	payment.Hydrate(ctx, &recv, "wire")
 	return recv.Wire.AccountNumber != "" || recv.Wire.IBAN != ""
+}
+
+// stripeStablecoins is what the Stripe account can take in stablecoins now: whether crypto is
+// enabled on it, on which networks, and that it is presented in USD only. A crypto method
+// is shown only where this says On.
+func stripeStablecoins(ctx context.Context, reg *processor.Registry) processor.StablecoinReady {
+	p, err := reg.Registered(processor.Stripe)
+	if err != nil || !p.IsAvailable(ctx) {
+		return processor.StablecoinReady{Why: "Stripe is not available"}
+	}
+	d, ok := p.(processor.StablecoinDepositor)
+	if !ok {
+		return processor.StablecoinReady{Why: "this Stripe cannot take stablecoin deposits"}
+	}
+	return d.StablecoinReady(ctx)
 }

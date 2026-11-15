@@ -192,6 +192,7 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 		}
 	}
 	excluded, ach := bankExclusions(ctx, sp, pol, cur, in.AmountCents)
+	excluded = withoutCrypto(ctx, reg, excluded)
 	verification := ""
 	if ach {
 		verification = "automatic"
@@ -393,4 +394,18 @@ func policyMethod(m string) string {
 		return "us_bank_account"
 	}
 	return m
+}
+
+// withoutCrypto adds crypto to the excluded types when Stripe cannot actually take
+// stablecoins now: a crypto method is shown only when Stripe can take it.
+func withoutCrypto(ctx context.Context, reg *processor.Registry, excluded []string) []string {
+	for _, m := range excluded {
+		if m == "crypto" {
+			return excluded
+		}
+	}
+	if !stripeStablecoins(ctx, reg).On {
+		excluded = append(excluded, "crypto")
+	}
+	return excluded
 }

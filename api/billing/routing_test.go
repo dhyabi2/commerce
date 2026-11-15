@@ -126,6 +126,18 @@ type rail struct {
 
 func (r rail) Type() processor.ProcessorType    { return r.kind }
 func (r rail) IsAvailable(context.Context) bool { return r.up }
+
+// A Stripe double takes stablecoin deposits while it is up: crypto is offered only when
+// Stripe can take it.
+func (r rail) StablecoinReady(context.Context) processor.StablecoinReady {
+	if r.kind == processor.Stripe && r.up {
+		return processor.StablecoinReady{On: true, Networks: []string{"base", "solana", "tempo"}, Currency: "usd"}
+	}
+	return processor.StablecoinReady{Why: "not available"}
+}
+func (rail) OpenStablecoinDeposit(context.Context, processor.StablecoinDepositIn) (*processor.StablecoinDeposit, error) {
+	return nil, errors.New("not in this test")
+}
 func (r rail) SupportedCurrencies() []currency.Type {
 	if r.kind == processor.Square {
 		return []currency.Type{currency.USD} // a US/USD Square location

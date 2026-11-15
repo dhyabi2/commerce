@@ -223,6 +223,8 @@ func TestCryptoRailsFollowThePolicyAndItsOrder(t *testing.T) {
 	pol := routing.Default()
 	setOn(&pol, "kraken", true)
 	pol.Accounts = accountsOf(baseUSDCEnv())
+	// Crypto is Stripe stablecoins by default; the admin adds Kraken for the coins Stripe lacks.
+	pol.CryptoRails = append(pol.CryptoRails, routing.CryptoRoute{Asset: "btc", Processor: "kraken"})
 	if _, f := WriteRouting(ctx, "", pol, "z", "kraken on"); f != nil {
 		t.Fatalf("policy: %v", f.Err)
 	}

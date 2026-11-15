@@ -163,15 +163,24 @@ type CryptoRoute struct {
 	Processor string `json:"processor"`
 }
 
-// DefaultCryptoRails: stablecoins Stripe takes go to Stripe (settled in USD into its
-// balance, no custody, no address, no watcher); the coins it does not take go to Kraken;
-// MPC self-custody is last and off by default.
+// DefaultCryptoRails is crypto as Stripe stablecoins only: USDC, USDP and USDG go to Stripe
+// (settled in USD into its balance, presented in USD only, no custody, no address minted by
+// us, no watcher). Kraken and MPC are processors an admin can add to the rails and switch
+// on; by default they take nothing.
 func DefaultCryptoRails() []CryptoRoute {
 	return []CryptoRoute{
 		{"usdc", string(processor.Stripe)}, {"usdp", string(processor.Stripe)}, {"usdg", string(processor.Stripe)},
-		{"btc", string(processor.Kraken)}, {"eth", string(processor.Kraken)}, {"sol", string(processor.Kraken)},
-		{"usdt", string(processor.Kraken)}, {"*", string(processor.Kraken)}, {"*", string(processor.MPC)},
 	}
+}
+
+// CryptoOffer is one asset a buyer may pay in and who takes it: the processor, the
+// currency the payment is presented in (stablecoins are USD only) and the networks it
+// takes it on.
+type CryptoOffer struct {
+	Asset     string   `json:"asset"`
+	Processor string   `json:"processor"`
+	Currency  string   `json:"currency"`
+	Networks  []string `json:"networks,omitempty"`
 }
 
 // StripeCrypto says Stripe's own crypto, stablecoins settled in USD into its balance and
@@ -720,7 +729,7 @@ type Decision struct {
 	// buyer, in the order the policy chose: "stripe" means the Payment Element's crypto
 	// option on a dollar intent (no address, no watcher); another processor means a
 	// deposit address minted for the payment.
-	Crypto []CryptoRoute `json:"crypto"`
+	Crypto []CryptoOffer `json:"crypto"`
 	// Alternatives are the other ways this buyer may pay, each its own button beside
 	// the card slot: "paypal" where PayPal operates, "crypto" where a deposit watcher
 	// is running. Filled by the caller, which knows what is configured.
