@@ -16,9 +16,11 @@ package secrets
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 
+	"github.com/hanzoai/commerce/log"
 	"github.com/hanzoai/namespace"
 	"github.com/zap-proto/zip"
 )
@@ -49,20 +51,111 @@ func Get() Reader {
 	return r
 }
 
-// String reads a secret and trims it, answering "" for every failure mode —
-// no reader, no such secret, unreadable. Callers treat absence and error the
-// same way (fall back), so collapsing them here keeps that decision in one
-// place instead of at each call site.
-func String(ctx context.Context, ref string) string {
+// What a host's Reader wraps to say why a secret did not read, so a failure is reported as
+// what it was and not as "empty": no such secret, no permission to read it, a read that timed
+// out, or a value that would not parse. Any other error is reported as an error of the reader.
+var (
+	ErrNotFound = errors.New("secret not found")
+	ErrDenied   = errors.New("permission denied")
+	ErrTimeout  = errors.New("read timed out")
+	ErrParse    = errors.New("value would not parse")
+)
+
+// Read reads a secret and trims it, and answers WHY when it cannot: no reader installed, the
+// reader's error, or an empty value. The value is never part of an error. A failure is
+// recorded (and logged once, until it changes or clears) so it is never silent.
+func Read(ctx context.Context, ref string) (string, error) {
 	rd := Get()
 	if rd == nil {
-		return ""
+		record(ref, "no secret reader installed")
+		return "", errNoReader
 	}
 	b, err := rd.GetSecret(ctx, ref)
-	if err != nil {
-		return ""
+	v := strings.TrimSpace(string(b))
+	switch {
+	case err != nil:
+		record(ref, reason(err))
+		return "", err
+	case v == "":
+		record(ref, "empty value")
+		return "", errEmpty
 	}
-	return strings.TrimSpace(string(b))
+	record(ref, "")
+	return v, nil
+}
+
+var (
+	errNoReader = errors.New("no secret reader installed")
+	errEmpty    = errors.New("empty value")
+
+	failMu sync.Mutex
+	failed = map[string]string{}
+)
+
+// reason names a reader error without its message where the kind is known.
+func reason(err error) string {
+	var ne interface{ Timeout() bool }
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return "not found"
+	case errors.Is(err, ErrDenied):
+		return "permission denied"
+	case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "timeout"
+	case errors.Is(err, ErrParse):
+		return "parse error"
+	}
+	msg := err.Error()
+	if len(msg) > 120 {
+		msg = msg[:120]
+	}
+	return "reader error: " + msg
+}
+
+// record keeps the last failure of ref and says so in the log when it changes.
+func record(ref, why string) {
+	failMu.Lock()
+	defer failMu.Unlock()
+	if failed[ref] == why {
+		return
+	}
+	if why == "" {
+		delete(failed, ref)
+		log.Info("secrets: %s reads again", ref)
+		return
+	}
+	failed[ref] = why
+	log.Warn("secrets: %s does not read: %s", ref, why)
+}
+
+// Failure is the last reason ref did not read, or "" when it reads (or was never asked).
+func Failure(ref string) string {
+	failMu.Lock()
+	defer failMu.Unlock()
+	return failed[ref]
+}
+
+// Diagnose reads ref and says why it does not: "" when it reads a non-empty secret, else
+// one of "no secret reader installed", "not found", "permission denied", "timeout",
+// "parse error", "empty value" or "reader error: <what the reader said, truncated>".
+func Diagnose(ctx context.Context, ref string) string {
+	_, err := Read(ctx, ref)
+	switch {
+	case err == nil:
+		return ""
+	case err == errNoReader:
+		return "no secret reader installed"
+	case err == errEmpty:
+		return "empty value"
+	}
+	return reason(err)
+}
+
+// String reads a secret and trims it. A failure returns "" for the callers that fall back,
+// and is recorded and logged by Read, so an unreadable secret is never silently an empty one.
+func String(ctx context.Context, ref string) string {
+	v, _ := Read(ctx, ref)
+	return v
 }
 
 // Org reads one of org's own secrets, orgs/<org>/<name>, and asks AS org.

@@ -77,45 +77,138 @@ func InstallRuntime(ctx context.Context) error {
 		return map[processor.ProcessorType]bool{}
 	})
 	err = applyRuntime(ctx, pol, version)
-	reportUnchargeable(ctx, pol)
+	reportUnchargeableOnChange(ctx, pol)
 	return err
 }
 
-// chargeProblems says what keeps the policy from charging: each processor that is on and
-// charges through an account (Stripe, Square, PayPal, ...) but holds none that is on, and,
-// when that is true of every one of them, that there is no way to charge at all.
-func chargeProblems(pol routing.Policy) []string {
-	needs := map[string]bool{}
-	for _, sp := range processor.Seeds {
-		needs[sp.Processor] = true
+// requiredFields are what an account must hold, resolved, for its processor to charge: the
+// secrets are read from KMS and the settings must be non-empty.
+var requiredFields = map[string]struct{ secrets, settings []string }{
+	"stripe":            {secrets: []string{"secretKey"}},
+	"square":            {secrets: []string{"accessToken"}, settings: []string{"locationId"}},
+	"paypal":            {secrets: []string{"clientSecret"}, settings: []string{"clientId"}},
+	"moonpay":           {secrets: []string{"apiKey", "secretKey"}},
+	"opennode":          {secrets: []string{"apiKey"}},
+	"bitpay":            {secrets: []string{"apiToken"}},
+	"coinbase_commerce": {secrets: []string{"apiKey"}},
+	"solanapay":         {settings: []string{"recipient"}},
+}
+
+// accountReasons says why an account cannot charge, one reason per secret that does not
+// resolve (named by its path and why, never its value) and per setting that is empty;
+// empty when it can.
+func accountReasons(ctx context.Context, a routing.Account) []string {
+	req := requiredFields[a.Processor]
+	var why []string
+	for _, name := range req.secrets {
+		ref := routing.Get(a.Secrets, name)
+		if ref == "" {
+			why = append(why, "secret "+name+" has no KMS path")
+			continue
+		}
+		if d := secrets.Diagnose(ctx, ref); d != "" {
+			why = append(why, "secret "+name+" at "+ref+": "+d)
+		}
 	}
+	for _, name := range req.settings {
+		if strings.TrimSpace(routing.Get(a.Settings, name)) == "" {
+			why = append(why, "setting "+name+" is empty")
+		}
+	}
+	return why
+}
+
+// chargeProblems says what keeps the policy from charging as it runs, by what RESOLVES and
+// not by what is listed: each processor that is on and charges through an account
+// (Stripe, Square, PayPal, ...) and has no account whose required secrets read from KMS and
+// whose required settings are set, with each reason; and, when that is true of every one of
+// them, that nothing can charge a card.
+func chargeProblems(ctx context.Context, pol routing.Policy) []string {
 	var problems []string
 	on, ready := 0, 0
 	for _, r := range pol.Processors {
-		if !r.On || !needs[r.Processor] {
+		if !r.On {
+			continue
+		}
+		if _, needs := requiredFields[r.Processor]; !needs {
 			continue
 		}
 		on++
-		has := false
+		var reasons []string
+		usable := false
+		any := false
 		for _, a := range pol.Accounts {
-			has = has || (a.Processor == r.Processor && a.On && a.Network == "")
+			if a.Processor != r.Processor || !a.On || a.Network != "" {
+				continue
+			}
+			any = true
+			why := accountReasons(ctx, a)
+			if takesCardsAccount(a.Processor) && !a.Cards {
+				why = append(why, "takes no cards")
+			}
+			if len(why) == 0 {
+				usable = true
+				break
+			}
+			for _, w := range why {
+				reasons = append(reasons, "account "+a.ID+" "+w)
+			}
 		}
-		if has {
+		switch {
+		case usable:
 			ready++
-		} else {
+		case !any:
 			problems = append(problems, r.Processor+" is on and holds no account to charge with")
+		default:
+			problems = append(problems, r.Processor+" is on and no account of it is able to charge (unchargeable): "+strings.Join(reasons, "; "))
 		}
 	}
 	if on > 0 && ready == 0 {
-		problems = append(problems, "no processor that is on holds an account: nothing can charge a card")
+		problems = append(problems, "no processor that is on can charge: nothing can charge a card")
 	}
 	return problems
 }
 
-// canCharge says some processor that is on holds an account to charge with.
-func canCharge(pol routing.Policy) bool {
-	for _, p := range chargeProblems(pol) {
-		if strings.HasPrefix(p, "no processor that is on") {
+// settlementFields are the secrets a processor needs to CONFIRM a payment it took (its webhook
+// signature): without one the money can be taken but credits cannot be confirmed.
+var settlementFields = map[string][]string{
+	"stripe": {"webhook"},
+	"square": {"webhookSignature"},
+}
+
+// settlementPrefix marks a problem of the settlement kind, distinct from an unchargeable one.
+const settlementPrefix = "settlement: "
+
+// settlementProblems says, for each on-processor that can charge, which settlement secret does
+// not resolve, with the ref and why. It never makes the processor unavailable: charging still
+// works, so these do not count in canCharge and do not raise routing.unchargeable.
+func settlementProblems(ctx context.Context, pol routing.Policy) []string {
+	var out []string
+	for _, r := range pol.Processors {
+		if !r.On {
+			continue
+		}
+		for _, a := range pol.Accounts {
+			if a.Processor != r.Processor || !a.On || a.Network != "" || len(accountReasons(ctx, a)) > 0 {
+				continue
+			}
+			for _, name := range settlementFields[a.Processor] {
+				ref := routing.Get(a.Secrets, name)
+				if ref == "" {
+					out = append(out, settlementPrefix+a.Processor+" account "+a.ID+" has no KMS path for "+name+": charges are taken but credits cannot be confirmed")
+				} else if d := secrets.Diagnose(ctx, ref); d != "" {
+					out = append(out, settlementPrefix+a.Processor+" account "+a.ID+" "+name+" at "+ref+": "+d+": charges are taken but credits cannot be confirmed")
+				}
+			}
+		}
+	}
+	return out
+}
+
+// canCharge says some processor that is on has an account that resolves.
+func canCharge(ctx context.Context, pol routing.Policy) bool {
+	for _, p := range chargeProblems(ctx, pol) {
+		if strings.HasPrefix(p, "no processor that is on can charge") {
 			return false
 		}
 	}
@@ -124,8 +217,30 @@ func canCharge(pol routing.Policy) bool {
 
 // reportUnchargeable says so, loudly, when the platform policy as it runs has a processor
 // on and no account for it: an alarm in the log and an event, never a silent boot.
+var lastProblems atomic.Value // string
+
+// reportUnchargeableOnChange reports when the set of problems differs from the last one
+// reported, and says so once it clears.
+func reportUnchargeableOnChange(ctx context.Context, pol routing.Policy) {
+	now := strings.Join(append(chargeProblems(ctx, pol), settlementProblems(ctx, pol)...), "\n")
+	if prev, _ := lastProblems.Load().(string); prev == now {
+		return
+	}
+	lastProblems.Store(now)
+	if now == "" {
+		log.Info("routing: the platform policy can charge as configured again")
+		return
+	}
+	reportUnchargeable(ctx, pol)
+}
+
 func reportUnchargeable(ctx context.Context, pol routing.Policy) {
-	problems := chargeProblems(pol)
+	if sp := settlementProblems(ctx, pol); len(sp) > 0 {
+		log.Error("ALARM: the platform routing policy cannot confirm what it charges: %s", strings.Join(sp, "; "))
+		_, _ = engine.EmitBillingEvent(webhookGuardDB(ctx), "routing.unsettleable", "routing", routingpolicy.Platform, "",
+			map[string]interface{}{"problems": sp}, nil)
+	}
+	problems := chargeProblems(ctx, pol)
 	if len(problems) == 0 {
 		return
 	}
@@ -244,21 +359,44 @@ func configureKraken(ctx context.Context, pol routing.Policy) {
 func StartRuntimeRefresh() (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		t := time.NewTicker(runtimeRefresh)
+		// While anything fails to read, retry on a backoff (1s doubling to runtimeRefresh) so one
+		// failed read at boot does not stick; healthy, read every runtimeRefresh.
+		wait := time.Second
+		t := time.NewTimer(wait)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				next := runtimeRefresh
 				pol, v, err := ReadRoutingVersioned(ctx, "")
 				if err != nil {
 					log.Warn("routing: the platform policy could not be reread: %v", err)
+					t.Reset(runtimeRefresh)
 					continue
 				}
 				if int64(v) != appliedVersion.Load() {
 					_ = applyRuntime(ctx, pol, v)
+				} else {
+					// Same policy: read its secrets again, so a secret sealed in KMS after boot
+					// (or rotated) reaches the processors without a restart.
+					runtimeMu.Lock()
+					applyAccounts(ctx, pol)
+					configureMPC(ctx, pol)
+					configureKraken(ctx, pol)
+					runtimeMu.Unlock()
 				}
+				reportUnchargeableOnChange(ctx, pol)
+				if len(chargeProblems(ctx, pol)) > 0 {
+					if wait *= 2; wait > runtimeRefresh {
+						wait = runtimeRefresh
+					}
+					next = wait
+				} else {
+					wait = time.Second
+				}
+				t.Reset(next)
 			}
 		}
 	}()
@@ -285,12 +423,19 @@ const currentSeedLevel = 2
 // crypto deposit accounts CRYPTO_DEPOSIT_* described, the MPC endpoint, an exchange
 // account where Kraken keys were set, and every processor's own account. Secrets are never
 // copied: an account holds the KMS path they live at.
+// holdsAccounts says the stored policy has at least one account: a policy with none, however
+// it came to be, is topped up from the environment, since nothing can charge without one.
+func holdsAccounts(row *routingpolicy.Row) bool {
+	pol, _ := policyOf(row)
+	return len(pol.Accounts) > 0
+}
+
 func seedRuntime(ctx context.Context) error {
 	row, found, err := routingpolicy.Get(ctx, routingpolicy.Platform)
 	if err != nil {
 		return err
 	}
-	if found && seeded(row.Rules) && seedLevel(row.Rules) >= currentSeedLevel {
+	if found && seeded(row.Rules) && seedLevel(row.Rules) >= currentSeedLevel && holdsAccounts(row) {
 		return nil
 	}
 	pol := routing.Default()
@@ -301,8 +446,9 @@ func seedRuntime(ctx context.Context) error {
 		pol, _ = policyOf(row)
 		version = row.Version
 		by = row.By
-		if seeded(row.Rules) {
-			// Seeded by a build that knew fewer accounts: add the ones it lacked.
+		{
+			// A stored policy (seeded by a build that knew fewer accounts, or written by an admin
+			// with none): add the accounts it lacks, and change nothing the admin set.
 			scratch := routing.Default()
 			scratch.Accounts = nil
 			seedFromEnvironment(ctx, &scratch, os.Environ())
@@ -320,8 +466,6 @@ func seedRuntime(ctx context.Context) error {
 				rows := policyRow(pol, by, version)
 				return routingpolicy.Put(ctx, routingpolicy.Platform, rows)
 			}
-		} else {
-			seedFromEnvironment(ctx, &pol, os.Environ())
 		}
 	} else {
 		seedFromEnvironment(ctx, &pol, os.Environ())
@@ -482,10 +626,39 @@ func seedFromEnvironment(ctx context.Context, pol *routing.Policy, environ []str
 		}
 	}
 	seedProcessorAccounts(ctx, pol, env)
+	dropInvalidSeeds(ctx, pol)
 	// The default crypto processor an operator named leads the rails for any asset.
 	if explicit := strings.ToLower(env["COMMERCE_DEFAULT_CRYPTO_PROCESSOR"]); explicit != "" {
 		pol.CryptoRails = append([]routing.CryptoRoute{{Asset: "*", Processor: explicit}}, routing.DefaultCryptoRails()...)
 	}
+}
+
+// takesCardsAccount says an account of this processor charges cards: the charge processors
+// whose accounts the seed makes (Stripe, Square, PayPal). The cards flag is what the routing
+// reads to count a processor usable, so a seeded charge account without it is unusable.
+func takesCardsAccount(proc string) bool {
+	switch proc {
+	case "stripe", "square", "paypal":
+		return true
+	}
+	return false
+}
+
+// dropInvalidSeeds removes from a seed the crypto accounts (MPC, Kraken) that an admin write
+// would refuse, naming each in the log, so a seeded policy always validates. Charge accounts
+// stay even when their secrets do not resolve: problems reports those.
+func dropInvalidSeeds(ctx context.Context, pol *routing.Policy) {
+	kept := pol.Accounts[:0]
+	for _, a := range pol.Accounts {
+		if a.Processor == string(processor.MPC) || a.Processor == string(processor.Kraken) {
+			if why := validateAccounts(ctx, routing.Policy{Accounts: []routing.Account{a}}); why != "" {
+				log.Warn("routing seed: leaving out %s account %s: %s", a.Processor, a.ID, why)
+				continue
+			}
+		}
+		kept = append(kept, a)
+	}
+	pol.Accounts = kept
 }
 
 func parseInt(s string) (int64, error) {
@@ -566,13 +739,38 @@ func resolveRef(ctx context.Context, a routing.Account) string {
 // concern; the path a secret is at is the one that resolves for it.
 var kmsFolders = []string{"/commerce-secrets", "/cloud"}
 
-// kmsFolder is the folder holding name for this deployment: the first of kmsFolders where
-// it resolves, else the first (the secret is then not found, and the first run says so).
+// kmsRoot is the network's secret root: the first of kmsFolders in which any secret this
+// deployment knows of (every processor's, MPC's, Kraken's) resolves. Every ref of a seed is
+// derived from it, so one unreadable or unsealed secret cannot land in another network's folder.
+func kmsRoot(ctx context.Context) string {
+	names := []string{"MPC_API_KEY", "KRAKEN_API_KEY"}
+	for _, sp := range processor.Seeds {
+		for _, f := range sp.Fields {
+			if f.Secret {
+				names = append(names, f.Envs...)
+			}
+		}
+	}
+	for _, f := range kmsFolders {
+		for _, n := range names {
+			if secrets.String(ctx, f+"/"+n) != "" {
+				return f
+			}
+		}
+	}
+	return ""
+}
+
+// kmsFolder is the folder holding name for this deployment: where it resolves, else the
+// network's root, else the first of kmsFolders (the secret is then not found, and problems say so).
 func kmsFolder(ctx context.Context, name string) string {
 	for _, f := range kmsFolders {
 		if secrets.String(ctx, f+"/"+name) != "" {
 			return f
 		}
+	}
+	if root := kmsRoot(ctx); root != "" {
+		return root
 	}
 	log.Warn("routing seed: %s resolves in none of %v; the account will name %s/%s", name, kmsFolders, kmsFolders[0], name)
 	return kmsFolders[0]
@@ -606,6 +804,7 @@ func seedProcessorAccounts(ctx context.Context, pol *routing.Policy, env map[str
 		if len(a.Secrets)+len(a.Settings) == 0 {
 			continue
 		}
+		a.Cards = takesCardsAccount(sp.Processor)
 		if sp.Deploys(env) {
 			a.Settings = append(a.Settings, routing.Named{Name: "deployment", Value: "true"})
 		}

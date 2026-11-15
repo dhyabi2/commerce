@@ -483,7 +483,7 @@ func saveRouting(ctx context.Context, scope string, p routing.Policy, by, note s
 	if err != nil {
 		return p, fault(503, "routing is temporarily unavailable; please retry", err)
 	}
-	if id == routingpolicy.Platform && canCharge(before) && !canCharge(p) {
+	if id == routingpolicy.Platform && canCharge(ctx, before) && !canCharge(ctx, p) {
 		// A save never takes the platform from able to charge to unable: that is a deploy
 		// with no card processor, found by its buyers.
 		why := "this policy leaves no processor that is on with an account to charge with; keep or add an account for one"
@@ -993,7 +993,7 @@ func ReadRoutingView(ctx context.Context, org *organization.Organization, scope 
 	}
 	v.Eligibility, _ = eligibility(ctx, registryFor(ctx, scope))
 	v.Brands, v.Methods, v.MethodNotes = routing.Brands, routing.MethodNames, routing.MethodNotes
-	v.Problems = chargeProblems(pol)
+	v.Problems = append(chargeProblems(ctx, pol), settlementProblems(ctx, pol)...)
 	if v.Problems == nil {
 		v.Problems = []string{}
 	}
