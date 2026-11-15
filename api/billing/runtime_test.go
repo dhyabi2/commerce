@@ -1021,3 +1021,80 @@ func TestKrakenAvailabilityFollowsTheDepositRailsCredentials(t *testing.T) {
 		t.Fatal("kraken is not available though its credentials read at the org root")
 	}
 }
+
+// A testnet whose host store keeps its keys at /orgs/hanzo/cloud is seeded with refs there,
+// and the test and sandbox accounts each hold a webhook secret of their own.
+func TestATestnetAtTheOrgRootSeedsRefsThereAndEachAccountItsWebhook(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{
+		"/orgs/hanzo/cloud/STRIPE_TEST_SECRET_KEY": "k", "/orgs/hanzo/cloud/STRIPE_WEBHOOK_SECRET": "w",
+		"/orgs/hanzo/cloud/SQUARE_SANDBOX_ACCESS_TOKEN": "a", "/orgs/hanzo/cloud/SQUARE_WEBHOOK_SIGNATURE_KEY": "s",
+	})
+	pol := routing.Default()
+	seedProcessorAccounts(ctx, &pol, map[string]string{
+		"STRIPE_SECRET_KEY": "sk_test_123", "STRIPE_TEST_SECRET_KEY": "sk_test_456", "STRIPE_WEBHOOK_SECRET": "y",
+		"SQUARE_SANDBOX_ACCESS_TOKEN": "x", "SQUARE_WEBHOOK_SIGNATURE_KEY": "y", "SQUARE_ENVIRONMENT": "sandbox",
+	})
+	want := map[string]string{"stripe/test": "webhook", "square/sandbox": "webhookSignature"}
+	for _, a := range pol.Accounts {
+		for _, n := range a.Secrets {
+			if !strings.HasPrefix(n.Value, "/orgs/hanzo/cloud/") {
+				t.Errorf("%s %s %s ref %s is not at the testnet org root", a.Processor, a.ID, n.Name, n.Value)
+			}
+		}
+		if f, ok := want[a.Processor+"/"+a.ID]; ok {
+			if routing.Get(a.Secrets, f) == "" {
+				t.Errorf("%s %s holds no %s", a.Processor, a.ID, f)
+			}
+			delete(want, a.Processor+"/"+a.ID)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("accounts not seeded: %v", want)
+	}
+	if sp := settlementProblems(ctx, pol); len(sp) != 0 {
+		t.Fatalf("settlement problems on a seeded testnet: %v", sp)
+	}
+}
+
+// On production a test-mode account never holds a live secret ref: it gets a webhook secret
+// of its own when one is provisioned, and none otherwise.
+func TestAProductionTestAccountHoldsNoLiveWebhookRef(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{"/orgs/hanzo/commerce-secrets/STRIPE_SECRET_KEY": "k", "/orgs/hanzo/commerce-secrets/STRIPE_WEBHOOK_SECRET": "live"})
+	live := map[string]string{
+		"STRIPE_SECRET_KEY": "sk_live_123", "STRIPE_WEBHOOK_SECRET": "whsec_live", "STRIPE_TEST_SECRET_KEY": "sk_test_456",
+		"SQUARE_ACCESS_TOKEN": "x", "SQUARE_WEBHOOK_SIGNATURE_KEY": "sig_live", "SQUARE_SANDBOX_ACCESS_TOKEN": "y",
+	}
+	webhookOf := func(env map[string]string, proc, id, field string) string {
+		pol := routing.Default()
+		seedProcessorAccounts(ctx, &pol, env)
+		for _, a := range pol.Accounts {
+			if a.Processor == proc && a.ID == id {
+				return routing.Get(a.Secrets, field)
+			}
+		}
+		t.Fatalf("no %s %s account", proc, id)
+		return ""
+	}
+	if got := webhookOf(live, "stripe", "live", "webhook"); !strings.HasSuffix(got, "/STRIPE_WEBHOOK_SECRET") {
+		t.Fatalf("the live account lost its webhook: %q", got)
+	}
+	if got := webhookOf(live, "stripe", "test", "webhook"); got != "" {
+		t.Fatalf("the production test account holds the live webhook ref %q", got)
+	}
+	if got := webhookOf(live, "square", "sandbox", "webhookSignature"); got != "" {
+		t.Fatalf("the production sandbox account holds the live signature ref %q", got)
+	}
+	own := map[string]string{}
+	for k, v := range live {
+		own[k] = v
+	}
+	own["STRIPE_TEST_WEBHOOK_SECRET"], own["SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY"] = "whsec_test", "sig_test"
+	if got := webhookOf(own, "stripe", "test", "webhook"); !strings.HasSuffix(got, "/STRIPE_TEST_WEBHOOK_SECRET") {
+		t.Fatalf("the test account's own webhook ref = %q", got)
+	}
+	if got := webhookOf(own, "square", "sandbox", "webhookSignature"); !strings.HasSuffix(got, "/SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY") {
+		t.Fatalf("the sandbox account's own signature ref = %q", got)
+	}
+}

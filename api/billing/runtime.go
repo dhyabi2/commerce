@@ -661,6 +661,17 @@ func dropInvalidSeeds(ctx context.Context, pol *routing.Policy) {
 	pol.Accounts = kept
 }
 
+// ownValue says the account already holds a value named name.
+func ownValue(a routing.Account, name string) (string, bool) {
+	if v := routing.Get(a.Secrets, name); v != "" {
+		return v, true
+	}
+	if v := routing.Get(a.Settings, name); v != "" {
+		return v, true
+	}
+	return "", false
+}
+
 func parseInt(s string) (int64, error) {
 	var n int64
 	for _, c := range s {
@@ -735,10 +746,11 @@ func resolveRef(ctx context.Context, a routing.Account) string {
 // kmsFolders are the KMS paths a deployment's processor secrets live at, from the
 // universe manifests that project them: production's are synced from /commerce-secrets
 // (cloud-commerce-kms-sync, cloud-stripe-kms-sync) and testnet's from /cloud
-// (cloud-env-kms-sync, KMS env testnet); Hanzo's own store keeps them at its org root,
-// /orgs/hanzo/commerce-secrets. Which network this is is the host's KMS reader's
+// (cloud-env-kms-sync, KMS env testnet); Hanzo's own store keeps them at its org root:
+// /orgs/hanzo/commerce-secrets for production and /orgs/hanzo/cloud for testnet. The seed
+// takes the folder in which the deployment's secrets resolve. Which network this is is the host's KMS reader's
 // concern; the path a secret is at is the one that resolves for it.
-var kmsFolders = []string{"/commerce-secrets", "/orgs/hanzo/commerce-secrets", "/cloud"}
+var kmsFolders = []string{"/commerce-secrets", "/orgs/hanzo/commerce-secrets", "/orgs/hanzo/cloud", "/cloud"}
 
 // kmsRoot is the network's secret root: the first of kmsFolders in which any secret this
 // deployment knows of (every processor's, MPC's, Kraken's) resolves. Every ref of a seed is
@@ -804,6 +816,26 @@ func seedProcessorAccounts(ctx context.Context, pol *routing.Policy, env map[str
 		}
 		if len(a.Secrets)+len(a.Settings) == 0 {
 			continue
+		}
+		for _, f := range sp.Shared {
+			if !sp.SharedAllowed(env) {
+				break
+			}
+			if _, own := ownValue(a, f.Name); own {
+				continue
+			}
+			for _, name := range f.Envs {
+				v := env[name]
+				if v == "" {
+					continue
+				}
+				if f.Secret {
+					a.Secrets = append(a.Secrets, routing.Named{Name: f.Name, Value: kmsPath(ctx, name)})
+				} else {
+					a.Settings = append(a.Settings, routing.Named{Name: f.Name, Value: v})
+				}
+				break
+			}
 		}
 		a.Cards = takesCardsAccount(sp.Processor)
 		if sp.Deploys(env) {
