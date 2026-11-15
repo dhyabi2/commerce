@@ -411,3 +411,100 @@ func withoutCrypto(ctx context.Context, reg *processor.Registry, excluded []stri
 	}
 	return excluded
 }
+
+// TopupIntentCancelled is the answer to cancelling a top-up.
+type TopupIntentCancelled struct {
+	IntentID string `json:"intentId"`
+	// State is canceled, whether this call cancelled it or an earlier one did.
+	State string `json:"state"`
+}
+
+// CancelTopupIntent cancels one of the caller's own top-up payments that has not been
+// confirmed, at the processor, and releases its place under the cap of open payments. It is
+// idempotent: a payment already cancelled answers cancelled again. A payment that has
+// succeeded, is being processed by the bank, or has been credited is 409, and one that is
+// not the caller's (or is not a top-up) is 404. Every cancellation is recorded as an event.
+func CancelTopupIntent(ctx context.Context, org *organization.Organization, subject, id string) (*TopupIntentCancelled, *PaymentFault) {
+	p, found, err := pendingintent.Get(id)
+	if err != nil {
+		return nil, fault(503, "billing is temporarily unavailable; please retry", err)
+	}
+	if !found || !strings.EqualFold(p.Subject, subject) || !strings.EqualFold(p.Org, org.Name) || p.Purpose != pendingintent.Topup {
+		return nil, fault(404, "payment not found", nil)
+	}
+	sp, err := processorsForOrg(org).Existing(ctx, processor.Stripe)
+	if err != nil {
+		return nil, fault(503, "Stripe is not available right now", err)
+	}
+	read := func() (*processor.Transaction, *PaymentFault) {
+		tx, terr := sp.GetTransaction(ctx, id)
+		if terr != nil {
+			return nil, fault(502, "the payment could not be read", terr)
+		}
+		return tx, nil
+	}
+	tx, f := read()
+	if f != nil {
+		return nil, f
+	}
+	refuse := func(tx *processor.Transaction) *PaymentFault {
+		switch tx.Status {
+		case "succeeded":
+			return fault(409, "this payment has succeeded and cannot be cancelled", nil)
+		case "processing":
+			return fault(409, "this payment is being processed by the bank and cannot be cancelled", nil)
+		}
+		if tx.ProcessorRef != "" {
+			if _, credited, _ := paymentorg.Get(tx.ProcessorRef); credited {
+				return fault(409, "this payment has been credited and cannot be cancelled", nil)
+			}
+		}
+		return nil
+	}
+	if f := refuse(tx); f != nil {
+		return nil, f
+	}
+	if tx.Status != "canceled" {
+		c, ok := sp.(interface {
+			CancelIntent(context.Context, string) error
+		})
+		if !ok {
+			return nil, fault(503, "this payment cannot be cancelled here", nil)
+		}
+		if cerr := c.CancelIntent(ctx, id); cerr != nil {
+			// It may have succeeded between the read and the cancel.
+			if again, rf := read(); rf == nil {
+				if f := refuse(again); f != nil {
+					return nil, f
+				}
+			}
+			return nil, fault(502, "the payment could not be cancelled", cerr)
+		}
+	}
+	first, serr := pendingintent.Settle(id)
+	if serr != nil {
+		return nil, fault(503, "billing is temporarily unavailable; please retry", serr)
+	}
+	if first {
+		if _, eerr := engine.EmitBillingEvent(webhookGuardDB(ctx), "topup.intent.canceled", "payment_intent", id, subject,
+			map[string]interface{}{"org": org.Name, "usdCents": p.Cents, "by": subject}, nil); eerr != nil {
+			log.Warn("topup intent %s: the cancellation was not recorded: %v", id, eerr)
+		}
+	}
+	return &TopupIntentCancelled{IntentID: id, State: "canceled"}, nil
+}
+
+// CancelTopupIntentHandler cancels one of the caller's own unconfirmed top-ups.
+//
+//	POST /v1/billing/topup/intent/:id/cancel
+func CancelTopupIntentHandler(c *zip.Ctx) error {
+	org, ok := middleware.GetOrganizationOK(c)
+	if !ok || org == nil {
+		return jsonhttp.Fail(c, 401, "sign in to add funds", nil)
+	}
+	out, f := CancelTopupIntent(c.Context(), org, userBillingKey(c), c.Param("id"))
+	if f != nil {
+		return jsonhttp.Fail(c, f.Status, f.Message, f.Err)
+	}
+	return c.JSON(200, out)
+}

@@ -330,6 +330,7 @@ func Route(r *zip.Group, args ...zip.Handler) {
 	// the intent, and where it stands. Nothing here credits; the verified webhook does.
 	user.Raw(http.MethodPost, "/topup/intent", CreateTopupIntent)
 	user.Raw(http.MethodGet, "/topup/intent/:id", GetTopupIntent)
+	user.Raw(http.MethodPost, "/topup/intent/:id/cancel", CancelTopupIntentHandler)
 
 	// Stablecoins through Stripe, headless: where to send them. Nothing here credits.
 	user.Raw(http.MethodPost, "/topup/crypto", CreateCryptoTopup)
