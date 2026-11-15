@@ -1292,6 +1292,7 @@ func TestLiveStripe_LocalIntentIsQuotedAndRecorded(t *testing.T) {
 		t.Fatalf("opening a payment credited %d", l.balance())
 	}
 	l.call("POST", "/payment_intents/"+out.IntentID+"/cancel", nil)
+
 }
 
 // ONE PAYMENT, ONE LEDGER ENTRY, whichever writer reaches it first. Real Stripe test-mode
@@ -1544,5 +1545,57 @@ func TestLiveStripe_AnIndianSaleThatNeedsTheBankIsBoundToItsQuoteAndAbandonedLea
 	}
 	if subs, _ := userSubscriptions(db, l.subject, true); len(subs) != 0 || l.balance() != 0 {
 		t.Fatalf("%d subscriptions and balance %d after the abandon; want none", len(subs), l.balance())
+	}
+}
+
+// A dollar checkout opens with ACH on offer, bank verification automatic (instant through the
+// bank login, microdeposits otherwise), the account's capabilities read from Stripe, and the
+// attempt bound as delayed so it outlives a card's 48 hours.
+func TestLiveStripe_ACHIsOfferedWithAutomaticVerificationAndWaitsForSettlement(t *testing.T) {
+	l := liveSetup(t)
+	sp, err := processorsForOrg(l.org).Existing(*l.ctx, processor.Stripe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps, ok := sp.(processor.Capable)
+	if !ok {
+		t.Fatal("the Stripe provider does not report its capabilities")
+	}
+	have := caps.Methods(*l.ctx)
+	if !have["us_bank_account"] && !have["pix"] && !have["upi"] {
+		t.Skipf("this test account takes no bank method (capabilities read: %v)", have)
+	}
+	out, f := OpenTopupIntent(*l.ctx, l.org, TopupIntentIn{Subject: l.subject, Country: "US", AmountCents: 2500, IdempotencyKey: "ach-" + l.run})
+	if f != nil {
+		t.Fatalf("opening a dollar checkout: %v", f.Err)
+	}
+	pi := l.call("GET", "/payment_intents/"+out.IntentID, nil)
+	if pi["status"] != "requires_payment_method" {
+		t.Fatalf("status = %v", pi["status"])
+	}
+	if have["us_bank_account"] {
+		opts, _ := pi["payment_method_options"].(map[string]any)
+		ba, _ := opts["us_bank_account"].(map[string]any)
+		if ba["verification_method"] != "automatic" {
+			t.Fatalf("bank verification = %v; want automatic", ba["verification_method"])
+		}
+		p, _, _ := pendingintent.Get(out.IntentID)
+		if p == nil || !p.Delayed {
+			t.Fatalf("an attempt with ACH on offer is not bound as delayed: %+v", p)
+		}
+	}
+	l.call("POST", "/payment_intents/"+out.IntentID+"/cancel", nil)
+	if have["us_bank_account"] {
+		// A checkout for the bank debit alone offers that and nothing else.
+		only, f := OpenTopupIntent(*l.ctx, l.org, TopupIntentIn{Subject: l.subject, Country: "US", AmountCents: 2500, Method: "us_bank_account", IdempotencyKey: "ach-only-" + l.run})
+		if f != nil {
+			t.Fatalf("an ACH-only checkout: %v", f.Err)
+		}
+		pi := l.call("GET", "/payment_intents/"+only.IntentID, nil)
+		types, _ := pi["payment_method_types"].([]any)
+		if len(types) != 1 || types[0] != "us_bank_account" {
+			t.Fatalf("payment method types = %v; want only us_bank_account", types)
+		}
+		l.call("POST", "/payment_intents/"+only.IntentID+"/cancel", nil)
 	}
 }

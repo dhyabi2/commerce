@@ -139,6 +139,12 @@ func HandleProviderWebhook(c *zip.Ctx) error {
 	if isClawbackEvent(event.Type) {
 		effects = append(effects, applyClawbackEvent(ctx, db, org, event))
 	}
+	// A payment that fails AFTER its credit posted (a bank debit that bounces) takes the credit
+	// back through the refund path, once, by the intent's id. A failure before any credit posted
+	// moves nothing.
+	if event.Processor == processor.Stripe && event.Type == "payment.failed" {
+		effects = append(effects, reverseFailedPayment(ctx, db, org, event))
+	}
 	// charge.refunded names the charge; the refunds on it are read from Stripe and
 	// each taken back once, by its own id.
 	if event.Processor == processor.Stripe && event.Type == "refund.succeeded" {
@@ -1732,4 +1738,25 @@ func traced(db *datastore.Datastore, org *organization.Organization, paymentID s
 	}
 	log.Warn("payment %s: the index was missing and was written again from %s's books", paymentID, org.Name)
 	return paymentorg.Get(paymentID)
+}
+
+// reverseFailedPayment takes back the credit of a payment the processor now reports failed,
+// when one was posted: it is a refund of the whole charge, keyed on the intent so a replayed
+// failure reverses it once. With no credit posted it does nothing.
+func reverseFailedPayment(ctx context.Context, db *datastore.Datastore, org *organization.Organization, event *processor.WebhookEvent) error {
+	charge := stringField(event.Data, "latest_charge")
+	if charge == "" {
+		return nil
+	}
+	if _, credited, err := paymentorg.Get(charge); err != nil || !credited {
+		return err
+	}
+	amount, _ := numberField(event.Data, "amount")
+	return applyClawbackEvent(ctx, db, org, &processor.WebhookEvent{
+		ID: "failed:" + stringField(event.Data, "payment_intent"), Type: "refund.created", Processor: event.Processor, Org: event.Org,
+		Data: map[string]interface{}{
+			"id": "failed:" + stringField(event.Data, "payment_intent"), "payment_id": charge, "status": "COMPLETED",
+			"amount": float64(amount), "currency": stringField(event.Data, "currency"),
+		},
+	})
 }

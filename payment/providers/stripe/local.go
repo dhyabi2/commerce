@@ -22,16 +22,30 @@ func (p *Provider) CreateLocalIntent(ctx context.Context, in processor.LocalInte
 	params := url.Values{}
 	params.Set("amount", strconv.FormatInt(in.Amount, 10))
 	params.Set("currency", strings.ToLower(in.Currency))
-	params.Set("automatic_payment_methods[enabled]", "true")
+	if len(in.Only) > 0 {
+		for i, m := range in.Only {
+			params.Set(fmt.Sprintf("payment_method_types[%d]", i), m)
+		}
+	} else {
+		params.Set("automatic_payment_methods[enabled]", "true")
+	}
 	// A voucher lives three days and a Pix code one, so an unpaid one ends by itself.
 	params.Set("payment_method_options[boleto][expires_after_days]", "3")
 	params.Set("payment_method_options[oxxo][expires_after_days]", "3")
 	params.Set("payment_method_options[pix][expires_after_seconds]", "86400")
-	if in.Configuration != "" {
-		params.Set("payment_method_configuration", in.Configuration)
+	if in.Verification != "" {
+		// A bank debit is verified instantly through the bank's login (Financial
+		// Connections) and by microdeposits when the bank is not covered.
+		params.Set("payment_method_options[us_bank_account][verification_method]", in.Verification)
+		params.Set("payment_method_options[us_bank_account][financial_connections][permissions][0]", "payment_method")
 	}
-	for i, m := range in.Excluded {
-		params.Set(fmt.Sprintf("excluded_payment_method_types[%d]", i), m)
+	if len(in.Only) == 0 {
+		if in.Configuration != "" {
+			params.Set("payment_method_configuration", in.Configuration)
+		}
+		for i, m := range in.Excluded {
+			params.Set(fmt.Sprintf("excluded_payment_method_types[%d]", i), m)
+		}
 	}
 	if in.Desc != "" {
 		params.Set("description", in.Desc)

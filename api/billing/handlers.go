@@ -238,6 +238,10 @@ func Route(r *zip.Group, args ...zip.Handler) {
 	// cloud. Found by the mint-surface guard, not by hand.
 	mint.Raw(http.MethodPost, "/reconciliation/match", ReconcileInboundTransfer)
 
+	// A wire the bank received, credited to the wallet that holds its reference, once and
+	// audited. Only the platform can attest that money landed.
+	mint.Raw(http.MethodPost, "/wire/reconcile", ReconcileWireHandler)
+
 	// Invoice sub-resources
 	api.Raw(http.MethodPost, "/invoices/:id/line-items", AddInvoiceLineItem)
 	api.Raw(http.MethodDelete, "/invoices/:id/line-items/:itemId", RemoveInvoiceLineItem)

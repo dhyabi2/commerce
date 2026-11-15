@@ -166,6 +166,10 @@ func intentOrg(ctx context.Context, name string, test bool) (*organization.Organ
 // reconcileIntent settles one intent, and answers an error when it could not — the
 // caller backs it off.
 func reconcileIntent(ctx context.Context, p *pendingintent.Intent) error {
+	if p.Purpose == pendingintent.Wire {
+		// A wire is credited by its reconciliation, not by a processor: nothing to ask.
+		return pendingintent.Wait(p.Id(), time.Now().Add(delayedLookEvery))
+	}
 	org, err := intentOrg(ctx, p.Org, p.Test)
 	if err != nil {
 		return err
@@ -183,8 +187,8 @@ func reconcileIntent(ctx context.Context, p *pendingintent.Intent) error {
 	case "requires_action", "requires_payment_method", "requires_confirmation", "processing":
 		deadline := p.CreatedAt.Add(abandonAfter)
 		switch {
-		case p.PaidCurrency != "" && p.Delayed:
-			// A voucher or a bank transfer (boleto, OXXO, SEPA debit, Pix) is paid days after
+		case p.Delayed:
+			// A voucher or a bank debit or transfer (boleto, OXXO, SEPA debit, ACH, Pix) is paid days after
 			// the buyer left, and cancelling it earlier would void a payment they may
 			// still make. Its webhook is the way it settles; this is the backstop, so it
 			// looks again every few hours until the voucher's own life is over.
@@ -196,7 +200,7 @@ func reconcileIntent(ctx context.Context, p *pendingintent.Intent) error {
 			deadline = time.Unix(p.LockExpiresAt, 0)
 		}
 		if time.Now().Before(deadline) {
-			if p.PaidCurrency != "" && p.Delayed {
+			if p.Delayed {
 				return pendingintent.Wait(p.Id(), time.Now().Add(delayedLookEvery))
 			}
 			// Only waiting on the buyer: not looked at again before its deadline, so a few

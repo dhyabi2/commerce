@@ -735,9 +735,10 @@ func resolveRef(ctx context.Context, a routing.Account) string {
 // kmsFolders are the KMS paths a deployment's processor secrets live at, from the
 // universe manifests that project them: production's are synced from /commerce-secrets
 // (cloud-commerce-kms-sync, cloud-stripe-kms-sync) and testnet's from /cloud
-// (cloud-env-kms-sync, KMS env testnet). Which network this is is the host's KMS reader's
+// (cloud-env-kms-sync, KMS env testnet); Hanzo's own store keeps them at its org root,
+// /orgs/hanzo/commerce-secrets. Which network this is is the host's KMS reader's
 // concern; the path a secret is at is the one that resolves for it.
-var kmsFolders = []string{"/commerce-secrets", "/cloud"}
+var kmsFolders = []string{"/commerce-secrets", "/orgs/hanzo/commerce-secrets", "/cloud"}
 
 // kmsRoot is the network's secret root: the first of kmsFolders in which any secret this
 // deployment knows of (every processor's, MPC's, Kraken's) resolves. Every ref of a seed is

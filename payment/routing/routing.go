@@ -382,7 +382,8 @@ var Brands = []string{"visa", "mastercard", "amex", "discover", "jcb", "unionpay
 // so their switches shape the lists the checkout mounts.
 var (
 	Excludable = []string{"pix", "boleto", "oxxo", "ideal", "bancontact", "sepa_debit", "p24", "blik", "eps", "paynow", "promptpay", "grabpay", "alipay", "wechat_pay", "klarna", "affirm", "afterpay_clearpay", "link", "cashapp",
-		"upi", "kakao_pay", "naver_pay", "payco", "samsung_pay", "kr_card", "twint", "swish", "mobilepay", "multibanco", "fpx"}
+		"upi", "kakao_pay", "naver_pay", "payco", "samsung_pay", "kr_card", "twint", "swish", "mobilepay", "multibanco", "fpx",
+		"us_bank_account", "acss_debit", "bacs_debit", "au_becs_debit"}
 	MethodNames = append(append([]string{}, Excludable...), "apple_pay", "google_pay", "cash_app")
 )
 
@@ -400,6 +401,7 @@ func in(list []string, v string) bool {
 var MethodCurrencies = map[string][]string{
 	"pix": {"brl"}, "boleto": {"brl"}, "oxxo": {"mxn"}, "ideal": {"eur"}, "bancontact": {"eur"}, "sepa_debit": {"eur"},
 	"p24": {"pln", "eur"}, "blik": {"pln"}, "eps": {"eur"}, "paynow": {"sgd"}, "promptpay": {"thb"}, "grabpay": {"sgd", "myr", "php"},
+	"us_bank_account": {"usd"}, "acss_debit": {"cad", "usd"}, "bacs_debit": {"gbp"}, "au_becs_debit": {"aud"},
 	"upi": {"inr"}, "kakao_pay": {"krw"}, "naver_pay": {"krw"}, "payco": {"krw"}, "samsung_pay": {"krw"}, "kr_card": {"krw"},
 	"wechat_pay": {"cny", "usd"}, "twint": {"chf"}, "swish": {"sek"}, "mobilepay": {"dkk", "eur"}, "multibanco": {"eur"}, "fpx": {"myr"},
 }
@@ -1184,3 +1186,70 @@ func KnownCountry(code string) bool {
 }
 
 const isoCountries = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW"
+
+// BankMethods are the bank payment methods Stripe takes from a buyer in country, in the
+// policy's method names; "us_bank_account" is ACH. A method is offered only where the
+// account's capability for it is active (processor.Capable) and the policy has it on.
+// Netbanking has no Stripe method of its own: Stripe takes Indian bank payments as UPI.
+func BankMethods(country string) []string {
+	country = strings.ToUpper(strings.TrimSpace(country))
+	var out []string
+	switch country {
+	case "US":
+		out = append(out, "us_bank_account")
+	case "CA":
+		out = append(out, "acss_debit")
+	case "GB":
+		out = append(out, "bacs_debit")
+	case "AU":
+		out = append(out, "au_becs_debit")
+	case "BR":
+		out = append(out, "pix")
+	case "IN":
+		out = append(out, "upi")
+	case "MY":
+		out = append(out, "fpx")
+	case "NL":
+		out = append(out, "ideal")
+	case "BE":
+		out = append(out, "bancontact")
+	case "PL":
+		out = append(out, "blik", "p24")
+	case "AT":
+		out = append(out, "eps")
+	case "PT":
+		out = append(out, "multibanco")
+	}
+	if sepaCountries[country] {
+		out = append(out, "sepa_debit")
+	}
+	return out
+}
+
+// sepaCountries are the countries whose banks take SEPA Direct Debit from Stripe.
+var sepaCountries = map[string]bool{
+	"AT": true, "BE": true, "BG": true, "HR": true, "CY": true, "CZ": true, "DK": true, "EE": true, "FI": true, "FR": true,
+	"DE": true, "GR": true, "HU": true, "IE": true, "IT": true, "LV": true, "LT": true, "LU": true, "MT": true, "NL": true,
+	"PL": true, "PT": true, "RO": true, "SK": true, "SI": true, "ES": true, "SE": true, "CH": true, "GB": true, "NO": true, "IS": true, "LI": true,
+}
+
+// DelayedMethod says a method settles after the buyer has left: a bank debit (days), a voucher or a
+// bank transfer. A payment opened where one is offered waits for its settlement past the
+// hour a card is given, and credits only when the processor reports it settled.
+func DelayedMethod(method string) bool {
+	switch strings.ToLower(method) {
+	case "pix", "boleto", "oxxo", "sepa_debit", "us_bank_account", "acss_debit", "bacs_debit", "au_becs_debit", "multibanco":
+		return true
+	}
+	return false
+}
+
+// ACHMaxCents is the most one bank-debit attempt may take, in US cents: a debit can be
+// returned for days after it settles, so a single attempt is bounded.
+const ACHMaxCents = 500000
+
+// BankMethodNames are the bank payment methods whose availability is read from the
+// account (every method BankMethods can name).
+func BankMethodNames() []string {
+	return []string{"us_bank_account", "acss_debit", "bacs_debit", "au_becs_debit", "sepa_debit", "ideal", "bancontact", "blik", "p24", "eps", "pix", "upi", "fpx", "multibanco"}
+}

@@ -965,3 +965,57 @@ func TestTheTopUpRunsOnTheAdminWrittenPoliciesLiveOnProdAndTestnet(t *testing.T)
 		}
 	}
 }
+
+// Secrets kept at Hanzo's org root are found by the seed, and name that root.
+func TestASeedFindsSecretsAtTheOrgRoot(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{"/orgs/hanzo/commerce-secrets/STRIPE_SECRET_KEY": "k"})
+	pol := routing.Default()
+	seedProcessorAccounts(ctx, &pol, map[string]string{"STRIPE_SECRET_KEY": "x", "STRIPE_WEBHOOK_SECRET": "y"})
+	for _, a := range pol.Accounts {
+		for _, n := range a.Secrets {
+			if !strings.HasPrefix(n.Value, "/orgs/hanzo/commerce-secrets/") {
+				t.Errorf("%s ref %s is not at the org root", n.Name, n.Value)
+			}
+		}
+	}
+}
+
+// The admin view's Kraken availability is the credential read the deposit rail makes: the
+// keys sealed at the org root make it available, and keys that do not read make it not.
+func TestKrakenAvailabilityFollowsTheDepositRailsCredentials(t *testing.T) {
+	ctx := heldStore(t)
+	installRuntime(t, ctx)
+	org := routingOrg(ctx, t)
+	t.Cleanup(func() { configureKraken(ctx, routing.Policy{}) })
+
+	pol := routing.Default()
+	setOn(&pol, "kraken", true)
+	pol.Accounts = []routing.Account{{Processor: "kraken", ID: "exchange", On: true, SecretRef: "/orgs/hanzo/commerce-secrets"}}
+	available := func() bool {
+		configureKraken(ctx, pol)
+		v, f := ReadRoutingView(ctx, org, "")
+		if f != nil {
+			t.Fatal(f.Err)
+		}
+		for _, s := range v.Processor {
+			if s.Processor == "kraken" {
+				return s.Available
+			}
+		}
+		t.Fatal("the view lists no kraken")
+		return false
+	}
+
+	useSecrets(t, mapSecrets{})
+	if available() {
+		t.Fatal("kraken is available with no credentials")
+	}
+	useSecrets(t, mapSecrets{
+		"/orgs/hanzo/commerce-secrets/KRAKEN_API_KEY":    "key",
+		"/orgs/hanzo/commerce-secrets/KRAKEN_API_SECRET": "c2VjcmV0", // base64, as Kraken issues it
+	})
+	if !available() {
+		t.Fatal("kraken is not available though its credentials read at the org root")
+	}
+}
