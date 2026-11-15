@@ -16,6 +16,7 @@ package secrets
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 
@@ -47,6 +48,40 @@ func Get() Reader {
 	mu.RLock()
 	defer mu.RUnlock()
 	return r
+}
+
+// ErrNotFound and ErrDenied are what a host's Reader wraps to say why a secret did not
+// read, so a failure can be reported as what it was: no such secret, or no permission to
+// read it. Any other error is reported as an error of the reader.
+var (
+	ErrNotFound = errors.New("secret not found")
+	ErrDenied   = errors.New("permission denied")
+)
+
+// Diagnose says why ref does not read, without the value: "" when it reads a non-empty
+// secret, else one of "no secret reader installed", "not found", "permission denied",
+// "empty value" or "reader error: <what the reader said, truncated>".
+func Diagnose(ctx context.Context, ref string) string {
+	rd := Get()
+	if rd == nil {
+		return "no secret reader installed"
+	}
+	b, err := rd.GetSecret(ctx, ref)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return "not found"
+	case errors.Is(err, ErrDenied):
+		return "permission denied"
+	case err != nil:
+		msg := err.Error()
+		if len(msg) > 120 {
+			msg = msg[:120]
+		}
+		return "reader error: " + msg
+	case strings.TrimSpace(string(b)) == "":
+		return "empty value"
+	}
+	return ""
 }
 
 // String reads a secret and trims it, answering "" for every failure mode —

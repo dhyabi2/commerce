@@ -77,45 +77,99 @@ func InstallRuntime(ctx context.Context) error {
 		return map[processor.ProcessorType]bool{}
 	})
 	err = applyRuntime(ctx, pol, version)
-	reportUnchargeable(ctx, pol)
+	reportUnchargeableOnChange(ctx, pol)
 	return err
 }
 
-// chargeProblems says what keeps the policy from charging: each processor that is on and
-// charges through an account (Stripe, Square, PayPal, ...) but holds none that is on, and,
-// when that is true of every one of them, that there is no way to charge at all.
-func chargeProblems(pol routing.Policy) []string {
-	needs := map[string]bool{}
-	for _, sp := range processor.Seeds {
-		needs[sp.Processor] = true
+// requiredFields are what an account must hold, resolved, for its processor to charge: the
+// secrets are read from KMS and the settings must be non-empty.
+var requiredFields = map[string]struct{ secrets, settings []string }{
+	"stripe":            {secrets: []string{"secretKey"}},
+	"square":            {secrets: []string{"accessToken"}, settings: []string{"locationId"}},
+	"paypal":            {secrets: []string{"clientSecret"}, settings: []string{"clientId"}},
+	"moonpay":           {secrets: []string{"apiKey", "secretKey"}},
+	"opennode":          {secrets: []string{"apiKey"}},
+	"bitpay":            {secrets: []string{"apiToken"}},
+	"coinbase_commerce": {secrets: []string{"apiKey"}},
+	"solanapay":         {settings: []string{"recipient"}},
+}
+
+// accountReasons says why an account cannot charge, one reason per secret that does not
+// resolve (named by its path and why, never its value) and per setting that is empty;
+// empty when it can.
+func accountReasons(ctx context.Context, a routing.Account) []string {
+	req := requiredFields[a.Processor]
+	var why []string
+	for _, name := range req.secrets {
+		ref := routing.Get(a.Secrets, name)
+		if ref == "" {
+			why = append(why, "secret "+name+" has no KMS path")
+			continue
+		}
+		if d := secrets.Diagnose(ctx, ref); d != "" {
+			why = append(why, "secret "+name+" at "+ref+": "+d)
+		}
 	}
+	for _, name := range req.settings {
+		if strings.TrimSpace(routing.Get(a.Settings, name)) == "" {
+			why = append(why, "setting "+name+" is empty")
+		}
+	}
+	return why
+}
+
+// chargeProblems says what keeps the policy from charging as it runs, by what RESOLVES and
+// not by what is listed: each processor that is on and charges through an account
+// (Stripe, Square, PayPal, ...) and has no account whose required secrets read from KMS and
+// whose required settings are set, with each reason; and, when that is true of every one of
+// them, that nothing can charge a card.
+func chargeProblems(ctx context.Context, pol routing.Policy) []string {
 	var problems []string
 	on, ready := 0, 0
 	for _, r := range pol.Processors {
-		if !r.On || !needs[r.Processor] {
+		if !r.On {
+			continue
+		}
+		if _, needs := requiredFields[r.Processor]; !needs {
 			continue
 		}
 		on++
-		has := false
+		var reasons []string
+		usable := false
+		any := false
 		for _, a := range pol.Accounts {
-			has = has || (a.Processor == r.Processor && a.On && a.Network == "")
+			if a.Processor != r.Processor || !a.On || a.Network != "" {
+				continue
+			}
+			any = true
+			why := accountReasons(ctx, a)
+			if len(why) == 0 {
+				usable = true
+				break
+			}
+			for _, w := range why {
+				reasons = append(reasons, "account "+a.ID+" "+w)
+			}
 		}
-		if has {
+		switch {
+		case usable:
 			ready++
-		} else {
+		case !any:
 			problems = append(problems, r.Processor+" is on and holds no account to charge with")
+		default:
+			problems = append(problems, r.Processor+" is on and no account of it resolves: "+strings.Join(reasons, "; "))
 		}
 	}
 	if on > 0 && ready == 0 {
-		problems = append(problems, "no processor that is on holds an account: nothing can charge a card")
+		problems = append(problems, "no processor that is on can charge: nothing can charge a card")
 	}
 	return problems
 }
 
-// canCharge says some processor that is on holds an account to charge with.
-func canCharge(pol routing.Policy) bool {
-	for _, p := range chargeProblems(pol) {
-		if strings.HasPrefix(p, "no processor that is on") {
+// canCharge says some processor that is on has an account that resolves.
+func canCharge(ctx context.Context, pol routing.Policy) bool {
+	for _, p := range chargeProblems(ctx, pol) {
+		if strings.HasPrefix(p, "no processor that is on can charge") {
 			return false
 		}
 	}
@@ -124,8 +178,25 @@ func canCharge(pol routing.Policy) bool {
 
 // reportUnchargeable says so, loudly, when the platform policy as it runs has a processor
 // on and no account for it: an alarm in the log and an event, never a silent boot.
+var lastProblems atomic.Value // string
+
+// reportUnchargeableOnChange reports when the set of problems differs from the last one
+// reported, and says so once it clears.
+func reportUnchargeableOnChange(ctx context.Context, pol routing.Policy) {
+	now := strings.Join(chargeProblems(ctx, pol), "\n")
+	if prev, _ := lastProblems.Load().(string); prev == now {
+		return
+	}
+	lastProblems.Store(now)
+	if now == "" {
+		log.Info("routing: the platform policy can charge as configured again")
+		return
+	}
+	reportUnchargeable(ctx, pol)
+}
+
 func reportUnchargeable(ctx context.Context, pol routing.Policy) {
-	problems := chargeProblems(pol)
+	problems := chargeProblems(ctx, pol)
 	if len(problems) == 0 {
 		return
 	}
@@ -258,7 +329,16 @@ func StartRuntimeRefresh() (stop func()) {
 				}
 				if int64(v) != appliedVersion.Load() {
 					_ = applyRuntime(ctx, pol, v)
+				} else {
+					// Same policy: read its secrets again, so a secret sealed in KMS after boot
+					// (or rotated) reaches the processors without a restart.
+					runtimeMu.Lock()
+					applyAccounts(ctx, pol)
+					configureMPC(ctx, pol)
+					configureKraken(ctx, pol)
+					runtimeMu.Unlock()
 				}
+				reportUnchargeableOnChange(ctx, pol)
 			}
 		}
 	}()

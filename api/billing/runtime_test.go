@@ -560,7 +560,7 @@ func TestACryptoOnlySeededPolicyIsToppedUpWithTheChargeAccounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _, _ := ReadRoutingVersioned(ctx, "")
-	if got := chargeProblems(before); len(got) != 2 {
+	if got := chargeProblems(ctx, before); len(got) != 2 {
 		t.Fatalf("the crypto-only policy reports %v; want square and paypal holding no account", got)
 	}
 
@@ -585,7 +585,7 @@ func TestACryptoOnlySeededPolicyIsToppedUpWithTheChargeAccounts(t *testing.T) {
 	if v != 4 {
 		t.Fatalf("version = %d; want 4 (one top-up)", v)
 	}
-	if got := chargeProblems(after); len(got) != 0 {
+	if got := chargeProblems(ctx, after); len(got) != 0 {
 		t.Fatalf("after the top-up: %v", got)
 	}
 	// Idempotent: a second boot adds nothing and moves no version.
@@ -601,19 +601,71 @@ func TestACryptoOnlySeededPolicyIsToppedUpWithTheChargeAccounts(t *testing.T) {
 // A platform policy with a processor on and no account to charge with is said loudly, and a
 // save cannot take a charging policy there.
 func TestAPolicyWithNothingToChargeWithIsReportedAndCannotBeSavedInto(t *testing.T) {
+	ctx := context.Background()
+	useSecrets(t, mapSecrets{"/commerce-secrets/STRIPE_SECRET_KEY": "x"})
 	pol := routing.Default()
-	if got := chargeProblems(pol); len(got) != 4 || canCharge(pol) {
+	if got := chargeProblems(ctx, pol); len(got) != 4 || canCharge(ctx, pol) {
 		t.Fatalf("problems for a policy with cards on and no account = %v", got)
 	}
-	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true}}
-	if got := chargeProblems(pol); len(got) != 2 || !canCharge(pol) {
+	pol.Accounts = []routing.Account{{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}}}
+	if got := chargeProblems(ctx, pol); len(got) != 2 || !canCharge(ctx, pol) {
 		t.Fatalf("with a stripe account: %v (square and paypal still hold none, but cards can charge)", got)
 	}
 	crypto := routing.Default()
 	for _, n := range []string{"stripe", "square", "paypal"} {
 		setOn(&crypto, n, false)
 	}
-	if got := chargeProblems(crypto); len(got) != 0 {
+	if got := chargeProblems(ctx, crypto); len(got) != 0 {
 		t.Fatalf("a policy with every account-backed processor off reports %v", got)
 	}
+}
+
+// The problem list keys on what RESOLVES, not on what is listed: an account whose secret
+// paths are not in KMS leaves its processor unable to charge, and the report names the path
+// and why (not found, permission denied, empty) and never a value.
+func TestProblemsKeyOnWhatResolvesAndNameTheFailingPathAndWhy(t *testing.T) {
+	ctx := context.Background()
+	pol := routing.Default()
+	pol.Accounts = []routing.Account{
+		{Processor: "stripe", ID: "live", On: true, Secrets: []routing.Named{{Name: "secretKey", Value: "/commerce-secrets/STRIPE_SECRET_KEY"}}},
+		{Processor: "square", ID: "live", On: true, Settings: []routing.Named{{Name: "locationId", Value: "LOC"}}, Secrets: []routing.Named{{Name: "accessToken", Value: "/commerce-secrets/SQUARE_ACCESS_TOKEN"}}},
+		{Processor: "paypal", ID: "live", On: true, Settings: []routing.Named{{Name: "clientId", Value: "pp"}}, Secrets: []routing.Named{{Name: "clientSecret", Value: "/commerce-secrets/PAYPAL_CLIENT_SECRET"}}},
+	}
+	// None resolves: each reader answer is a different reason.
+	secrets.Set(failingSecrets{"/commerce-secrets/STRIPE_SECRET_KEY": secrets.ErrNotFound, "/commerce-secrets/SQUARE_ACCESS_TOKEN": secrets.ErrDenied, "/commerce-secrets/PAYPAL_CLIENT_SECRET": nil})
+	t.Cleanup(func() { secrets.Set(nil) })
+	got := strings.Join(chargeProblems(ctx, pol), "\n")
+	for _, want := range []string{
+		"stripe is on and no account of it resolves: account live secret secretKey at /commerce-secrets/STRIPE_SECRET_KEY: not found",
+		"square is on and no account of it resolves: account live secret accessToken at /commerce-secrets/SQUARE_ACCESS_TOKEN: permission denied",
+		"paypal is on and no account of it resolves: account live secret clientSecret at /commerce-secrets/PAYPAL_CLIENT_SECRET: empty value",
+		"no processor that is on can charge",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("problems lack %q:\n%s", want, got)
+		}
+	}
+	if canCharge(ctx, pol) {
+		t.Fatal("a policy whose every secret fails to resolve reports it can charge")
+	}
+	// One resolves: the others are still named, but cards can charge.
+	secrets.Set(mapSecrets{"/commerce-secrets/STRIPE_SECRET_KEY": "v"})
+	if !canCharge(ctx, pol) || len(chargeProblems(ctx, pol)) != 2 {
+		t.Fatalf("with Stripe's key resolving: %v", chargeProblems(ctx, pol))
+	}
+	// With no reader installed nothing resolves, and it says so.
+	secrets.Set(nil)
+	if !strings.Contains(strings.Join(chargeProblems(ctx, pol), "\n"), "no secret reader installed") {
+		t.Fatal("no reader, and the report does not say so")
+	}
+}
+
+// failingSecrets answers each path with the error it is given (nil: an empty value).
+type failingSecrets map[string]error
+
+func (f failingSecrets) GetSecret(_ context.Context, ref string) ([]byte, error) {
+	if err, ok := f[ref]; ok && err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
