@@ -321,6 +321,16 @@ func applySettlementEvent(ctx context.Context, db *datastore.Datastore, org *org
 		return nil
 	}
 
+	// A stablecoin deposit that pays a plan's first period or a renewal is applied to that,
+	// not credited to a wallet.
+	if event.Processor == processor.Stripe {
+		if pi := stringField(pay, "payment_intent"); pi != "" {
+			if p, found, _ := pendingintent.Get(pi); found && deposits(p) {
+				return finishDeposit(ctx, p, paymentID)
+			}
+		}
+	}
+
 	// WHOSE MONEY THIS IS, or nobody's. Everything below this line addresses the
 	// wallet this answers with; nothing below it can invent one.
 	who, why, err := settlementDestination(db, org, event, pay, kind, paymentID)

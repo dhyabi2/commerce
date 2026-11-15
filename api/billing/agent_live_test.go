@@ -368,3 +368,44 @@ func (l *liveStripe) succeededForSubject() int {
 	}
 	return n
 }
+
+func TestLiveStripe_AgentIsWarnedBeforeTheTokenRunsOut(t *testing.T) {
+	l := liveSetup(t)
+	// A token with room for the first period only.
+	tok := l.grant(grantSpec{max: 1500, recurring: "month"})
+	out := l.buy(ItemIn{Kind: "plan", Plan: "pro-3x"}, tok, "warn-1")
+	if out.Status != 200 || out.View.Order == nil {
+		t.Fatalf("first charge = %d %+v", out.Status, out.View)
+	}
+	subID := out.View.Order.SubscriptionID
+	// The order and the subscription say how much room is left: none for the next renewal.
+	read, _ := ReadCheckout(*l.ctx, l.org, l.subject, out.View.ID)
+	if read.Order.Token == nil || read.Order.Token.Covers || read.Order.Token.RemainingCents != 0 || read.Order.Token.RenewalCents != 1500 {
+		t.Fatalf("the order's token = %+v", read.Order.Token)
+	}
+	// The renewal is two days off: the agent is told once, before any attempt.
+	db := datastore.New(l.org.Namespaced(*l.ctx))
+	s := reload(t, db, subID)
+	s.PeriodEnd = time.Now().Add(48 * time.Hour)
+	if err := s.Update(); err != nil {
+		t.Fatal(err)
+	}
+	before := billingEventsOf(t, *l.ctx, "renewal.action_required")
+	warnTokenRenewals(*l.ctx, l.org)
+	warnTokenRenewals(*l.ctx, l.org)
+	if n := billingEventsOf(t, *l.ctx, "renewal.action_required"); n != before+1 {
+		t.Fatalf("renewal.action_required events = %d; want %d (once, ahead of the attempt)", n, before+1)
+	}
+	// A fresh token with room covers it.
+	room, aerr, f := SupplySubscriptionToken(*l.ctx, l.org, l.subject, subID, l.grant(grantSpec{max: 4500, recurring: "month"}))
+	if f != nil || aerr != nil || !room.Covers || room.RemainingCents != 4500 {
+		t.Fatalf("a fresh token = %+v %+v %v", room, aerr, f)
+	}
+	if one := (func() *TokenRoom { return subscriptionRoom(*l.ctx, l.org, subID) })(); one == nil || !one.Covers {
+		t.Fatalf("the subscription's token after refresh = %+v", one)
+	}
+	// A token without the room is refused.
+	if _, aerr, _ := SupplySubscriptionToken(*l.ctx, l.org, l.subject, subID, l.grant(grantSpec{max: 1000, recurring: "month"})); aerr == nil || aerr.Code != "token_over_limit" {
+		t.Fatalf("a token without room = %+v", aerr)
+	}
+}

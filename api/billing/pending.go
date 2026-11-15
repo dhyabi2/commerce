@@ -224,6 +224,10 @@ func reconcileIntent(ctx context.Context, p *pendingintent.Intent) error {
 		_, _ = pendingintent.Settle(p.Id())
 		return nil
 	}
+	if deposits(p) {
+		// A stablecoin deposit that succeeded pays its plan or its renewal; it is never refunded.
+		return finishDeposit(ctx, p, tx.ProcessorRef)
+	}
 	if p.Purpose == pendingintent.Sale || p.Purpose == pendingintent.Invoice {
 		// Money taken for a plan or an invoice that never finished is returned.
 		if _, found, _ := paymentorg.Get(tx.ProcessorRef); found {

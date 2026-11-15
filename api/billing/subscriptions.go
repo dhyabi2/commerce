@@ -997,7 +997,11 @@ func GetBillingSubscription(c *zip.Ctx) error {
 		return http.Fail(c, 404, "subscription not found", err)
 	}
 
-	return c.JSON(200, subscriptionResponse(sub))
+	resp := subscriptionResponse(sub)
+	if room := subscriptionRoom(c.Context(), org, sub.Id()); room != nil {
+		resp["token"] = room
+	}
+	return c.JSON(200, resp)
 }
 
 // UpdateBillingSubscription updates a subscription (plan change, quantity).

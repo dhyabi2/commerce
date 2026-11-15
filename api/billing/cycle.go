@@ -141,6 +141,7 @@ func RenewDue(ctx context.Context) (*RenewalRun, error) {
 	}
 	run := &RenewalRun{Orgs: len(orgs), Results: make([]Renewal, 0)}
 	for _, org := range orgs {
+		warnTokenRenewals(ctx, org)
 		for _, r := range renewDue(ctx, org, "") {
 			switch {
 			case r.Lapsed:
