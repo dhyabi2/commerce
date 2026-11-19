@@ -19,9 +19,11 @@ import (
 	"github.com/hanzoai/commerce/datastore"
 	"github.com/hanzoai/commerce/log"
 	"github.com/hanzoai/commerce/middleware"
+	"github.com/hanzoai/commerce/models/checkoutsession"
 	"github.com/hanzoai/commerce/models/cryptopaymentintent"
 	"github.com/hanzoai/commerce/models/organization"
 	"github.com/hanzoai/commerce/models/paymentorg"
+	"github.com/hanzoai/commerce/models/pendingintent"
 	"github.com/hanzoai/commerce/models/subscription"
 	"github.com/hanzoai/commerce/models/types/currency"
 	"github.com/hanzoai/commerce/payment/processor"
@@ -267,6 +269,26 @@ func GetCryptoOptions(ctx context.Context) (CryptoOptions, error) {
 	var assets []CryptoAsset
 	if err == nil {
 		assets = offeredAssets(watchedAssets(), cp.SupportedChains())
+	}
+	if pol, perr := ReadRouting(ctx, ""); perr == nil && pol.StripeCrypto() {
+		if ready := stripeStablecoins(ctx, processor.Global()); ready.On {
+			for _, net := range ready.Networks {
+				if net != "base" && net != "solana" {
+					continue
+				}
+				have := false
+				for _, a := range assets {
+					if strings.EqualFold(a.Chain, net) && strings.EqualFold(a.Token, "usdc") {
+						have = true
+						break
+					}
+				}
+				if !have {
+					assets = append(assets, CryptoAsset{Chain: net, Token: "usdc"})
+				}
+			}
+			err = nil
+		}
 	}
 	return menu(assets, err, gateway.Default().Networks())
 }
@@ -564,6 +586,37 @@ func CreateCryptoDeposit(ctx context.Context, org *organization.Organization, pa
 		token = "usdc"
 	}
 
+	if amountCents > 0 && token == "usdc" && (chain == "base" || chain == "solana" || chain == "tempo") {
+		if pol, polVer, perr := ReadRoutingVersioned(ctx, org.Name); perr == nil && pol.StripeCrypto() && stripeStablecoins(ctx, processorsForOrg(org)).On {
+			dep, net, f := stripeDeposit(ctx, org, payer, amountCents, chain,
+				fmt.Sprintf("crypto-topup:%s:%s:%d", chain, token, time.Now().Unix()/idemWindowSec),
+				fmt.Sprintf("Top-up %d usd for %s", amountCents, payer))
+			if f == nil && dep != nil && len(dep.Addresses) > 0 {
+				addr := dep.Addresses[0].Address
+				for _, a := range dep.Addresses {
+					if strings.EqualFold(a.Network, net) && a.Address != "" {
+						addr = a.Address
+						break
+					}
+				}
+				if rerr := pendingintent.PutQuoted(dep.ID, org.Name, strings.ToLower(payer), pendingintent.Topup, amountCents, "usd", 0, "", polVer, org.TestMode()); rerr != nil {
+					cancelDeposit(ctx, org, dep.ID)
+					return CryptoDeposit{}, rerr
+				}
+				_ = pendingintent.Bind(dep.ID, pendingintent.Terms{Delayed: true})
+				return CryptoDeposit{
+					ID:             dep.ID,
+					Status:         string(cryptopaymentintent.Pending),
+					Chain:          net,
+					Token:          token,
+					DepositAddress: addr,
+					ExpiresAt:      time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+					AmountCents:    amountCents,
+				}, nil
+			}
+		}
+	}
+
 	// THE GATE, and it is the whole reason this rail may take money at all: an
 	// address is handed out only for an asset something is watching. Asked before
 	// any keygen, because an address that is never minted is one nobody can send
@@ -734,6 +787,53 @@ func CreateCryptoDepositForPlan(ctx context.Context, org *organization.Organizat
 		chargeCents = engine.Discounted(chargeCents, offer.Coupon().Percent)
 		if chargeCents <= 0 {
 			return CryptoDeposit{}, depositValidationError{"coupon leaves nothing to charge"}
+		}
+	}
+	normChain := strings.ToLower(strings.TrimSpace(chain))
+	if normChain == "" {
+		normChain = "base"
+	}
+	normToken := strings.ToLower(strings.TrimSpace(token))
+	if normToken == "" {
+		normToken = "usdc"
+	}
+	if normToken == "usdc" && (normChain == "base" || normChain == "solana" || normChain == "tempo") {
+		if pol, _, perr := ReadRoutingVersioned(ctx, org.Name); perr == nil && pol.StripeCrypto() && stripeStablecoins(ctx, processorsForOrg(org)).On {
+			dep, net, f := stripeDeposit(ctx, org, payer, chargeCents, normChain,
+				fmt.Sprintf("crypto-plan:%s:%s:%d", q.slug, normChain, time.Now().Unix()/idemWindowSec),
+				fmt.Sprintf("Subscription %s — first period for %s", q.slug, payer))
+			if f == nil && dep != nil && len(dep.Addresses) > 0 {
+				addr := dep.Addresses[0].Address
+				for _, a := range dep.Addresses {
+					if strings.EqualFold(a.Network, net) && a.Address != "" {
+						addr = a.Address
+						break
+					}
+				}
+				sess := new(checkoutsession.Session)
+				sess.SetId(newSessionID())
+				sess.Org, sess.Subject, sess.Test, sess.Status = org.Name, strings.ToLower(payer), org.TestMode(), checkoutsession.Pending
+				sess.Line, sess.Plan, sess.Interval, sess.TotalCents, sess.Intent = checkoutsession.Plan, q.slug, string(q.plan.Interval), chargeCents, dep.ID
+				if serr := checkoutsession.Put(sess); serr != nil {
+					cancelDeposit(ctx, org, dep.ID)
+					return CryptoDeposit{}, serr
+				}
+				if rerr := pendingintent.PutRef(dep.ID, org.Name, strings.ToLower(payer), pendingintent.Plan, sess.Id(), chargeCents, "usd", org.TestMode()); rerr != nil {
+					cancelDeposit(ctx, org, dep.ID)
+					return CryptoDeposit{}, rerr
+				}
+				_ = pendingintent.Bind(dep.ID, pendingintent.Terms{Delayed: true})
+				return CryptoDeposit{
+					ID:             dep.ID,
+					Status:         string(cryptopaymentintent.Pending),
+					Chain:          net,
+					Token:          normToken,
+					DepositAddress: addr,
+					ExpiresAt:      time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+					AmountCents:    chargeCents,
+					PlanID:         q.slug,
+				}, nil
+			}
 		}
 	}
 	dep, err := CreateCryptoDeposit(ctx, org, payer, chain, token, chargeCents)
@@ -982,6 +1082,31 @@ func GetCryptoDeposit(ctx context.Context, org *organization.Organization, payer
 	}
 	if payer == "" {
 		return CryptoDeposit{}, errors.New("crypto deposit: no payer")
+	}
+	if strings.HasPrefix(id, "pi_") {
+		p, found, err := pendingintent.Get(id)
+		if err != nil || !found || !strings.EqualFold(p.Subject, payer) || !strings.EqualFold(p.Org, org.Name) {
+			return CryptoDeposit{}, errDepositNotFound
+		}
+		st := string(cryptopaymentintent.Pending)
+		if p.Done {
+			st = string(cryptopaymentintent.Succeeded)
+		}
+		var planID, subID string
+		if p.Purpose == pendingintent.Plan && p.Ref != "" {
+			if s, ok, _ := checkoutsession.Get(p.Ref); ok && s != nil {
+				planID, subID = s.Plan, s.SubscriptionID
+			}
+		}
+		return CryptoDeposit{
+			ID:             p.Id(),
+			Status:         st,
+			Chain:          "base",
+			Token:          "usdc",
+			AmountCents:    p.Cents,
+			PlanID:         planID,
+			SubscriptionID: subID,
+		}, nil
 	}
 	db := datastore.New(org.Namespaced(ctx))
 	intent := cryptopaymentintent.New(db)

@@ -42,13 +42,25 @@ func (p *Provider) Vault(ctx context.Context, customerID, paymentMethodID string
 		}
 		return processor.Card{}, &processor.ActionRequired{ID: si.ID, ClientSecret: si.ClientSecret}
 	}
+	var pm stripePaymentMethod
+	if strings.HasPrefix(paymentMethodID, "pm_") {
+		_ = p.get(ctx, "/payment_methods/"+url.PathEscape(paymentMethodID), nil, &pm)
+	}
 	params := url.Values{}
 	params.Set("customer", customerID)
 	params.Set("payment_method", paymentMethodID)
 	params.Set("confirm", "true")
 	params.Set("usage", "off_session")
-	params.Set("automatic_payment_methods[enabled]", "true")
-	params.Set("automatic_payment_methods[allow_redirects]", "never")
+	if pm.Type == "cashapp" || pm.Type == "us_bank_account" {
+		params.Set("payment_method_types[0]", pm.Type)
+		params.Set("return_url", "https://hanzo.ai/pay/return")
+		params.Set("mandate_data[customer_acceptance][type]", "online")
+		params.Set("mandate_data[customer_acceptance][online][ip_address]", "0.0.0.0")
+		params.Set("mandate_data[customer_acceptance][online][user_agent]", "hanzo-pay")
+	} else {
+		params.Set("automatic_payment_methods[enabled]", "true")
+		params.Set("automatic_payment_methods[allow_redirects]", "never")
+	}
 
 	var si struct {
 		ID            string `json:"id"`
@@ -176,10 +188,20 @@ type stripePaymentMethod struct {
 		Last4       string `json:"last4"`
 		Fingerprint string `json:"fingerprint"`
 	} `json:"us_bank_account"`
+	Cashapp struct {
+		Cashtag string `json:"cashtag"`
+	} `json:"cashapp"`
 	Customer string `json:"customer"`
 }
 
 func (m stripePaymentMethod) card() processor.Card {
+	if m.Type == "cashapp" {
+		return processor.Card{
+			ID: m.ID, Brand: "cashapp",
+			Last4:      strings.TrimPrefix(strings.TrimSpace(m.Cashapp.Cashtag), "$"),
+			CustomerID: m.Customer, Country: "US",
+		}
+	}
 	if m.Type == "us_bank_account" || (m.Card.Last4 == "" && m.USBankAccount.Last4 != "") {
 		return processor.Card{
 			ID: m.ID, Brand: cmp.Or(strings.TrimSpace(m.USBankAccount.BankName), "Bank account"),

@@ -148,12 +148,12 @@ func (p *Provider) Charge(ctx context.Context, req processor.PaymentRequest) (*p
 	if strings.HasPrefix(req.Token, "pi_") {
 		return p.completeIntent(ctx, req)
 	}
-	// The card's own country, read from the card: a buyer cannot choose it.
+	var pm stripePaymentMethod
 	if strings.HasPrefix(req.Token, "pm_") {
-		card, err := p.card(ctx, req.Token)
-		if err != nil {
+		if err := p.get(ctx, "/payment_methods/"+url.PathEscape(req.Token), nil, &pm); err != nil {
 			return &processor.PaymentResult{Success: false, ErrorMessage: err.Error(), Error: err}, err
 		}
+		card := pm.card()
 		if processor.Sanctioned(card.Country) {
 			return &processor.PaymentResult{Success: false, ErrorMessage: errSanctioned.Error(), Error: errSanctioned}, errSanctioned
 		}
@@ -167,8 +167,6 @@ func (p *Provider) Charge(ctx context.Context, req processor.PaymentRequest) (*p
 	params.Set("amount", strconv.FormatInt(int64(req.Amount), 10))
 	params.Set("currency", strings.ToLower(string(req.Currency)))
 	params.Set("confirm", "true")
-	params.Set("automatic_payment_methods[enabled]", "true")
-	params.Set("automatic_payment_methods[allow_redirects]", "never")
 
 	if req.Token != "" {
 		params.Set("payment_method", req.Token)
@@ -176,8 +174,26 @@ func (p *Provider) Charge(ctx context.Context, req processor.PaymentRequest) (*p
 	if req.CustomerID != "" {
 		params.Set("customer", req.CustomerID)
 	}
-	if off, _ := req.Options["offSession"].(bool); off {
-		params.Set("off_session", "true")
+	off, _ := req.Options["offSession"].(bool)
+	save, _ := req.Options["saveForOffSession"].(bool)
+	if pm.Type == "cashapp" || pm.Type == "us_bank_account" {
+		params.Set("payment_method_types[0]", pm.Type)
+		if off || (pm.Customer != "" && pm.Customer == req.CustomerID) {
+			params.Set("off_session", "true")
+		} else {
+			params.Set("return_url", "https://hanzo.ai/pay/return")
+			if save {
+				params.Set("mandate_data[customer_acceptance][type]", "online")
+				params.Set("mandate_data[customer_acceptance][online][ip_address]", "0.0.0.0")
+				params.Set("mandate_data[customer_acceptance][online][user_agent]", "hanzo-pay")
+			}
+		}
+	} else {
+		params.Set("automatic_payment_methods[enabled]", "true")
+		params.Set("automatic_payment_methods[allow_redirects]", "never")
+		if off {
+			params.Set("off_session", "true")
+		}
 	}
 	if req.Description != "" {
 		params.Set("description", req.Description)

@@ -1,6 +1,9 @@
 package billing
 
 import (
+	"errors"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/hanzoai/commerce/datastore"
@@ -169,4 +172,64 @@ func TestActivateCryptoPlan_OpensSubscriptionAndLeavesRemainder(t *testing.T) {
 	if sub.Status != subscription.Active || sub.DefaultPaymentMethod != "credits" {
 		t.Fatalf("activated sub = %+v; want active with credits until card/bank added", sub)
 	}
+}
+
+func TestLiveStripe_UniformCashAppBankAndNativeCryptoPlan(t *testing.T) {
+	l := liveSetup(t)
+	pl := plan.New(plan.AuthorityDB(*l.ctx))
+	pl.Slug = "go"
+	pl.Name = "Go"
+	pl.Price = currency.Cents(800)
+	pl.Currency = currency.USD
+	pl.Interval = types.Monthly
+	pl.IntervalCount = 1
+	pl.Category = "personal"
+	pl.Status = plan.StatusActive
+	pl.Managed = true
+	pl.MustCreate()
+
+	// 1. Uniform Cash App Pay pm_ -> SetupIntent ActionRequired (402 step) via CreateMethod.
+	pmObj := l.call("POST", "/payment_methods", url.Values{"type": {"cashapp"}})
+	pmID := str(pmObj["id"])
+	_, _, err := CreateMethod(*l.ctx, l.org, "cashapp-live@hanzo.ai", CreateMethodIn{
+		CustomerId:   l.subject,
+		Type:         "card",
+		ProviderRef:  pmID,
+		ProviderType: "stripe",
+	})
+	var ar *processor.ActionRequired
+	if !errors.As(err, &ar) || !strings.HasPrefix(ar.ID, "seti_") || ar.ClientSecret == "" {
+		t.Fatalf("CashApp CreateMethod = %v; want *processor.ActionRequired with seti_ clientSecret", err)
+	}
+
+	// 2. Uniform US bank account SetupIntent via CreateMethod.
+	_, _, err = CreateMethod(*l.ctx, l.org, "bank-live@hanzo.ai", CreateMethodIn{
+		CustomerId:   l.subject,
+		Type:         "card",
+		ProviderRef:  "us_bank_account",
+		ProviderType: "stripe",
+	})
+	var arBank *processor.ActionRequired
+	if !errors.As(err, &arBank) || !strings.HasPrefix(arBank.ID, "seti_") || arBank.ClientSecret == "" {
+		t.Fatalf("US bank CreateMethod = %v; want *processor.ActionRequired with seti_ clientSecret", err)
+	}
+
+	// 3. Native server-side Crypto plan deposit via CreateCryptoDepositForPlan (zero Stripe UI embed)
+	//    and uniform readback via GetCryptoDeposit.
+	dep, err := CreateCryptoDepositForPlan(*l.ctx, l.org, l.subject, "base", "usdc", 0, CryptoPlanIn{
+		PlanID:   "go",
+		Quantity: 1,
+		Interval: types.Monthly,
+	})
+	if err != nil {
+		t.Fatalf("CreateCryptoDepositForPlan (base/usdc): %v", err)
+	}
+	if !strings.HasPrefix(dep.ID, "pi_") || !strings.HasPrefix(dep.DepositAddress, "0x") || dep.AmountCents != 800 || dep.PlanID != "go" {
+		t.Fatalf("unexpected native crypto plan deposit: %+v", dep)
+	}
+	readBack, err := GetCryptoDeposit(*l.ctx, l.org, l.subject, dep.ID)
+	if err != nil || readBack.ID != dep.ID || readBack.Status != "pending" || readBack.PlanID != "go" {
+		t.Fatalf("GetCryptoDeposit(%s) = %+v, %v", dep.ID, readBack, err)
+	}
+	l.call("POST", "/payment_intents/"+dep.ID+"/cancel", nil)
 }

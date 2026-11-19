@@ -262,11 +262,6 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 			return nil, fault(422, "bank transfer (ACH) is not available for this payment", nil)
 		}
 		only = []string{"us_bank_account"}
-	} else if strings.EqualFold(in.Method, "crypto") {
-		if !stripeStablecoins(ctx, reg).On {
-			return nil, fault(422, "Stripe crypto is not available for this payment", nil)
-		}
-		only = []string{"crypto"}
 	}
 	desc := fmt.Sprintf("Top-up %d usd for %s", in.AmountCents, in.Subject)
 	if planSlug != "" {
@@ -277,7 +272,7 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 		Customer:          customer,
 		ReceiptEmail:      payer.Email,
 		Verification:      verification,
-		SaveForOffSession: planSlug != "" && customer != "" && !strings.EqualFold(in.Method, "crypto"),
+		SaveForOffSession: planSlug != "" && customer != "",
 		Amount:            paid,
 		Currency:          cur,
 		Excluded:          excluded,
