@@ -1,7 +1,7 @@
 package billing
 
 import (
-	"errors"
+	"encoding/json"
 	"net/url"
 	"strings"
 	"testing"
@@ -197,9 +197,9 @@ func TestLiveStripe_UniformCashAppBankAndNativeCryptoPlan(t *testing.T) {
 		ProviderRef:  pmID,
 		ProviderType: "stripe",
 	})
-	var ar *authRequired
-	if !errors.As(err, &ar) || !strings.HasPrefix(ar.ID, "seti_") || ar.ClientSecret == "" {
-		t.Fatalf("CashApp CreateMethod = %v; want *authRequired with seti_ clientSecret", err)
+	var ar authRequired
+	if err == nil || json.Unmarshal([]byte(err.Error()), &ar) != nil || ar.Code != "authentication_required" || !strings.HasPrefix(ar.ID, "seti_") || ar.ClientSecret == "" {
+		t.Fatalf("CashApp CreateMethod = %v; want authRequired JSON with seti_ clientSecret", err)
 	}
 
 	// 2. Uniform US bank account SetupIntent via CreateMethod.
@@ -209,9 +209,9 @@ func TestLiveStripe_UniformCashAppBankAndNativeCryptoPlan(t *testing.T) {
 		ProviderRef:  "us_bank_account",
 		ProviderType: "stripe",
 	})
-	var arBank *authRequired
-	if !errors.As(err, &arBank) || !strings.HasPrefix(arBank.ID, "seti_") || arBank.ClientSecret == "" {
-		t.Fatalf("US bank CreateMethod = %v; want *authRequired with seti_ clientSecret", err)
+	var arBank authRequired
+	if err == nil || json.Unmarshal([]byte(err.Error()), &arBank) != nil || arBank.Code != "authentication_required" || !strings.HasPrefix(arBank.ID, "seti_") || arBank.ClientSecret == "" {
+		t.Fatalf("US bank CreateMethod = %v; want authRequired JSON with seti_ clientSecret", err)
 	}
 
 	// 3. Native server-side Crypto plan deposit via CreateCryptoDepositForPlan (zero Stripe UI embed)
