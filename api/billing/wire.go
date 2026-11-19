@@ -62,7 +62,11 @@ func WireFor(ctx context.Context, host, payer string) (WireInstructions, error) 
 		return WireInstructions{}, fmt.Errorf("%w: reading the org serving %q: %s", errNoWire, brand, err)
 	}
 	if !found {
-		return WireInstructions{}, fmt.Errorf("%w: no org serves %q", errNoWire, brand)
+		if brand == checkout.DefaultBrandSlug() {
+			recv.Name = brand
+		} else {
+			return WireInstructions{}, fmt.Errorf("%w: no org serves %q", errNoWire, brand)
+		}
 	}
 
 	// The brand is the org the money is sent to, so its own bank details are read:

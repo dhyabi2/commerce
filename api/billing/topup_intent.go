@@ -140,9 +140,9 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 	if err != nil {
 		return nil, fault(503, "routing is temporarily unavailable; please retry", err)
 	}
-	if !pol.LocalOn || d.Reason == "saved" {
+	if !pol.LocalOn || (d.Reason == "saved" && (in.Method == "" || strings.EqualFold(in.Method, "card"))) {
 		// A saved card is charged through the saved-card top-up; the Payment Element
-		// is for a buyer paying anew.
+		// is for a buyer paying anew or choosing a non-card method (ACH, crypto).
 		return nil, fault(422, "local payment methods are not offered for this checkout", nil)
 	}
 	if cerr := atCap(in.Subject); cerr != nil {
@@ -262,6 +262,11 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 			return nil, fault(422, "bank transfer (ACH) is not available for this payment", nil)
 		}
 		only = []string{"us_bank_account"}
+	} else if strings.EqualFold(in.Method, "crypto") {
+		if !stripeStablecoins(ctx, reg).On {
+			return nil, fault(422, "Stripe crypto is not available for this payment", nil)
+		}
+		only = []string{"crypto"}
 	}
 	desc := fmt.Sprintf("Top-up %d usd for %s", in.AmountCents, in.Subject)
 	if planSlug != "" {
@@ -272,7 +277,7 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 		Customer:          customer,
 		ReceiptEmail:      payer.Email,
 		Verification:      verification,
-		SaveForOffSession: planSlug != "" && customer != "",
+		SaveForOffSession: planSlug != "" && customer != "" && !strings.EqualFold(in.Method, "crypto"),
 		Amount:            paid,
 		Currency:          cur,
 		Excluded:          excluded,

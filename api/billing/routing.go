@@ -725,9 +725,12 @@ func place(ctx context.Context, org *organization.Organization, in RouteIn, live
 	// this checkout's currency now. When it cannot (Square in euros, a processor that is
 	// down), the saved step does not apply: the checkout falls through to eligibility and the
 	// merchant step like a buyer with no saved card, and the saved card is simply not offered.
-	saved := savedProcessor(ctx, org, in.Subject)
-	if saved != "" && !take2(ctx, reg, cur, saved) {
-		saved = ""
+	var saved processor.ProcessorType
+	if in.Method == "" || strings.EqualFold(in.Method, "card") {
+		saved = savedProcessor(ctx, org, in.Subject)
+		if saved != "" && !take2(ctx, reg, cur, saved) {
+			saved = ""
+		}
 	}
 	// A Square charge begun for this payer and not yet known to have ended holds them
 	// where they are: no other processor is offered until it is known whether the
