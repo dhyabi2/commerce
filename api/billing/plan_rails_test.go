@@ -197,9 +197,9 @@ func TestLiveStripe_UniformCashAppBankAndNativeCryptoPlan(t *testing.T) {
 		ProviderRef:  pmID,
 		ProviderType: "stripe",
 	})
-	var ar *processor.ActionRequired
+	var ar *authRequired
 	if !errors.As(err, &ar) || !strings.HasPrefix(ar.ID, "seti_") || ar.ClientSecret == "" {
-		t.Fatalf("CashApp CreateMethod = %v; want *processor.ActionRequired with seti_ clientSecret", err)
+		t.Fatalf("CashApp CreateMethod = %v; want *authRequired with seti_ clientSecret", err)
 	}
 
 	// 2. Uniform US bank account SetupIntent via CreateMethod.
@@ -209,9 +209,9 @@ func TestLiveStripe_UniformCashAppBankAndNativeCryptoPlan(t *testing.T) {
 		ProviderRef:  "us_bank_account",
 		ProviderType: "stripe",
 	})
-	var arBank *processor.ActionRequired
+	var arBank *authRequired
 	if !errors.As(err, &arBank) || !strings.HasPrefix(arBank.ID, "seti_") || arBank.ClientSecret == "" {
-		t.Fatalf("US bank CreateMethod = %v; want *processor.ActionRequired with seti_ clientSecret", err)
+		t.Fatalf("US bank CreateMethod = %v; want *authRequired with seti_ clientSecret", err)
 	}
 
 	// 3. Native server-side Crypto plan deposit via CreateCryptoDepositForPlan (zero Stripe UI embed)
