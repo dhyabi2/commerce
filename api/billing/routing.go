@@ -721,14 +721,16 @@ func place(ctx context.Context, org *organization.Organization, in RouteIn, live
 	if cur == "" {
 		cur = currency.USD
 	}
-	// A saved card holds the buyer to its processor only while that processor can charge
-	// this checkout's currency now. When it cannot (Square in euros, a processor that is
-	// down), the saved step does not apply: the checkout falls through to eligibility and the
+	in.Method = policyMethod(in.Method)
+	// A saved card holds the buyer to its processor only for a card checkout, and only while
+	// that processor is switched on and can charge this checkout's currency now. When it is
+	// switched off or cannot take the currency (Square in euros, a processor that is down),
+	// the saved step does not apply: the checkout falls through to eligibility and the
 	// merchant step like a buyer with no saved card, and the saved card is simply not offered.
 	var saved processor.ProcessorType
 	if in.Method == "" || strings.EqualFold(in.Method, "card") {
 		saved = savedProcessor(ctx, org, in.Subject)
-		if saved != "" && !take2(ctx, reg, cur, saved) {
+		if saved != "" && (!pol.On(saved) || !take2(ctx, reg, cur, saved)) {
 			saved = ""
 		}
 	}
