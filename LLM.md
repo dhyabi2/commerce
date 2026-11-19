@@ -1149,6 +1149,23 @@ balance and mixed are not a card), with its refunds, dispute and the paying
 card's fingerprint, plus every fingerprint the subject keeps on file. Both are
 platform-only plane ops in cloud (`billing_gift`, `billing_payments`).
 
+## Five payments waiting on a bank, and a payment past its deadline is not one (api/billing/pending.go)
+
+A buyer may have `maxUnfinished` (5) payments waiting on their bank; the next is
+refused 429 "too many payments are waiting on your bank" (`atCap`). It counts only
+the rows commerce is still waiting on: one past `abandonsAt` (a card's 48 hours, a
+delayed method's eight days, a locked quote's lock; a wire has no deadline) holds no
+place, closed or not. `abandonsAt` is the ONE deadline, read by the cap and by the
+sweep that cancels the payment at Stripe and closes the row (`reconcileIntent`).
+
+That sweep (`reconcileIntents`) runs only inside `RenewDue`, the renewal sweep, so a
+deployment that never runs the renewal sweep never closes an abandoned payment.
+Cloud's testnet has no schedules, and before the cap read the deadline, five such
+rows refused the cloud release's test buyer every top-up from 2026-11-16, which
+held every cloud release out of production. A row past its deadline still waits
+for the sweep to cancel and close it; a late success is still credited by its
+webhook. Test: `pending_cap_test.go`.
+
 ## Cross-Compilation (2026-02-23)
 
 Colima QEMU crashes Go's HTTP/2 and module loader on ARM Mac. Use zig for cross-compilation:
