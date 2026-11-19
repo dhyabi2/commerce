@@ -300,13 +300,14 @@ func OpenFor(subject, ref string) (*Intent, error) {
 	return best, nil
 }
 
-// CountOpen is how many intents subject has waiting.
-func CountOpen(subject string) (int, error) {
+// OpenOf lists the intents subject has not settled, however old: which of them are
+// still waiting on their buyer is the reader's question (billing's deadline).
+func OpenOf(subject string) ([]*Intent, error) {
 	rows := make([]*Intent, 0)
 	if _, err := db().Query("pending-intent").Filter("Subject=", subject).Filter("Done=", false).GetAll(&rows); err != nil {
-		return 0, err
+		return nil, err
 	}
-	return len(rows), nil
+	return rows, nil
 }
 
 // Since lists the subject's intents for purpose recorded at or after since, newest

@@ -68,11 +68,48 @@ var errTooManyUnfinished = errors.New("too many payments are waiting on your ban
 // needs its bank has by then already made an intent at Stripe, and a refusal after that
 // leaves an intent no one holds the secret to. registerActionFor asks it again, which
 // is the backstop for two requests that both passed.
+//
+// A payment past its deadline (abandonsAt) is not waiting any more and holds no place,
+// whether or not the sweep has closed it yet. The sweep runs only inside the renewal
+// sweep, which a deployment may never run (testnet has no schedules), and counting
+// those rows refused every later payment of their buyer for good.
 func atCap(subject string) error {
-	if n, err := pendingintent.CountOpen(strings.ToLower(subject)); err == nil && n >= maxUnfinished {
+	rows, err := pendingintent.OpenOf(strings.ToLower(subject))
+	if err != nil {
+		return nil
+	}
+	now, waiting := time.Now(), 0
+	for _, p := range rows {
+		if at, ok := abandonsAt(p); ok && !now.Before(at) {
+			continue
+		}
+		waiting++
+	}
+	if waiting >= maxUnfinished {
 		return errTooManyUnfinished
 	}
 	return nil
+}
+
+// abandonsAt is when commerce stops waiting on p's buyer: the deadline past which the
+// sweep cancels an unfinished payment, and past which it holds no place under the cap.
+// A wire has none (false): it waits on its reconciliation, not on its buyer.
+func abandonsAt(p *pendingintent.Intent) (time.Time, bool) {
+	switch {
+	case p.Purpose == pendingintent.Wire:
+		return time.Time{}, false
+	case p.Delayed:
+		// A voucher or a bank debit or transfer (boleto, OXXO, SEPA debit, ACH, Pix) is
+		// paid days after the buyer left, and cancelling it earlier would void a payment
+		// they may still make.
+		return p.CreatedAt.Add(delayedAbandonAfter), true
+	case p.PaidCurrency != "" && p.LockExpiresAt > 0:
+		// A card on a locked quote: once the lock lapses the amount charged matches no
+		// live quote, so the attempt is abandoned there, not days later. A buyer who
+		// returns is re-quoted and shown the new amount before they authorize.
+		return time.Unix(p.LockExpiresAt, 0), true
+	}
+	return p.CreatedAt.Add(abandonAfter), true
 }
 
 const (
@@ -185,22 +222,11 @@ func reconcileIntent(ctx context.Context, p *pendingintent.Intent) error {
 	switch tx.Status {
 	case "succeeded":
 	case "requires_action", "requires_payment_method", "requires_confirmation", "processing":
-		deadline := p.CreatedAt.Add(abandonAfter)
-		switch {
-		case p.Delayed:
-			// A voucher or a bank debit or transfer (boleto, OXXO, SEPA debit, ACH, Pix) is paid days after
-			// the buyer left, and cancelling it earlier would void a payment they may
-			// still make. Its webhook is the way it settles; this is the backstop, so it
-			// looks again every few hours until the voucher's own life is over.
-			deadline = p.CreatedAt.Add(delayedAbandonAfter)
-		case p.PaidCurrency != "" && p.LockExpiresAt > 0:
-			// A card on a locked quote: once the lock lapses the amount charged matches no
-			// live quote, so the attempt is abandoned there, not days later. A buyer who
-			// returns is re-quoted and shown the new amount before they authorize.
-			deadline = time.Unix(p.LockExpiresAt, 0)
-		}
+		deadline, _ := abandonsAt(p) // a wire returned above
 		if time.Now().Before(deadline) {
 			if p.Delayed {
+				// A delayed method's webhook is the way it settles; this is the backstop,
+				// so it looks again every few hours until the voucher's own life is over.
 				return pendingintent.Wait(p.Id(), time.Now().Add(delayedLookEvery))
 			}
 			// Only waiting on the buyer: not looked at again before its deadline, so a few
