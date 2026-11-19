@@ -159,6 +159,11 @@ func (p *Provider) Cards(ctx context.Context, customerID string) ([]processor.Ca
 
 // FindCustomer finds the customer made under reference, "" when there is none.
 func (p *Provider) FindCustomer(ctx context.Context, reference string) (string, error) {
+	if reference != "" {
+		if id, ok := madeCustomers.Load(p.key() + "\x00" + reference); ok {
+			return id.(string), nil
+		}
+	}
 	q := "metadata['reference']:'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(reference) + "'"
 	var list struct {
 		Data []stripeCustomer `json:"data"`

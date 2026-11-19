@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/hanzoai/commerce/payment/processor"
 )
 
-var _ processor.PayerProfiles = (*Provider)(nil)
+var (
+	_             processor.PayerProfiles = (*Provider)(nil)
+	madeCustomers sync.Map                // p.key()+"\x00"+reference -> customerID
+)
 
 // payerParams are the customer fields of p that are known, in Stripe's form.
 // Metadata carries the org and the user so the customer is recognised in the
@@ -45,6 +49,13 @@ func payerParams(p processor.Payer) url.Values {
 // per reference, whatever retries: Stripe answers a repeated create under the same
 // key with the customer already made.
 func (p *Provider) CreateCustomerFor(ctx context.Context, payer processor.Payer, reference string, metadata map[string]interface{}) (string, error) {
+	cacheKey := p.key() + "\x00" + reference
+	if reference != "" {
+		if id, ok := madeCustomers.Load(cacheKey); ok {
+			_ = p.ProfileCustomer(ctx, id.(string), payer)
+			return id.(string), nil
+		}
+	}
 	params := payerParams(payer)
 	for k, v := range metadata {
 		if k == "org" || k == "user" {
@@ -58,7 +69,18 @@ func (p *Provider) CreateCustomerFor(ctx context.Context, payer processor.Payer,
 	}
 	var cust stripeCustomer
 	if err := p.postKey(ctx, "/customers", params, key, &cust); err != nil {
-		return "", err
+		// Another replica created this customer moments ago with slightly different
+		// profile fields (e.g. buyer fixed a typo before search indexed it): create
+		// with a parameter-scoped key so the checkout never fails on idempotency mismatch.
+		if key != "" && strings.Contains(strings.ToLower(err.Error()), "idempotent") {
+			err = p.postKey(ctx, "/customers", params, fitKey(key+":"+params.Encode()), &cust)
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	if reference != "" && cust.ID != "" {
+		madeCustomers.Store(cacheKey, cust.ID)
 	}
 	return cust.ID, nil
 }
