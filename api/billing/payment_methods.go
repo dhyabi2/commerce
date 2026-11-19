@@ -266,6 +266,9 @@ func CreateMethod(ctx context.Context, org *organization.Organization, email str
 			if err != nil {
 				return nil, false, declineError{parseCardDeclineReason(&processor.PaymentResult{ErrorMessage: err.Error()}, err)}
 			}
+			// Any subscription paid by crypto or a single-use wallet (credits/stablecoin)
+			// now auto-renews on this newly saved Square/Stripe card or bank account.
+			armUnbackedRenewals(ctx, org, in.CustomerId, pm)
 			// A Stripe card saved is where a Square holder's renewals move to.
 			if providerOf(pm) == processor.Stripe {
 				repointRenewals(ctx, org, in.CustomerId, pm)

@@ -53,6 +53,9 @@ func (p *Provider) CreateLocalIntent(ctx context.Context, in processor.LocalInte
 	if in.Customer != "" {
 		params.Set("customer", in.Customer)
 	}
+	if in.SaveForOffSession {
+		params.Set("setup_future_usage", "off_session")
+	}
 	if e := strings.TrimSpace(in.ReceiptEmail); e != "" {
 		params.Set("receipt_email", e)
 	}

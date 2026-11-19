@@ -1,6 +1,7 @@
 package stripe
 
 import (
+	"cmp"
 	"context"
 	"net/url"
 	"strings"
@@ -8,18 +9,38 @@ import (
 	"github.com/hanzoai/commerce/payment/processor"
 )
 
-// Vault saves a card the browser's Stripe.js minted (a PaymentMethod, "pm_…") to
-// a customer for later off-session charges, and reports the card.
+// Vault saves a card or bank account the browser's Stripe.js minted ("pm_…") to
+// a customer for later off-session charges, and reports the instrument.
 //
-// It is a SetupIntent, not a bare attach: Stripe verifies the card with its bank
+// It is a SetupIntent, not a bare attach: Stripe verifies the card or bank account
 // and records the buyer's consent to be charged without being present, which is
-// what a renewal or an auto-reload relies on. A card whose bank wants the buyer's
-// authentication is refused with *processor.ActionRequired, nothing saved.
+// what a renewal or an auto-reload relies on. An instrument whose bank wants the
+// buyer's authentication or Financial Connections login is answered with
+// *processor.ActionRequired, nothing saved until finished.
 func (p *Provider) Vault(ctx context.Context, customerID, paymentMethodID string) (processor.Card, error) {
 	// A SetupIntent the buyer authenticated in the browser ("seti_…") is finished,
 	// not made again: it must have succeeded FOR THIS CUSTOMER.
 	if strings.HasPrefix(paymentMethodID, "seti_") {
 		return p.finishSetup(ctx, customerID, paymentMethodID)
+	}
+	// Connecting a US bank account (ACH) opens an unconfirmed SetupIntent with
+	// Financial Connections instant verification so the browser collects the bank
+	// login + recurring debit mandate and returns with the finished seti_… id.
+	if strings.EqualFold(paymentMethodID, "us_bank_account") || strings.EqualFold(paymentMethodID, "ach") {
+		params := url.Values{}
+		params.Set("customer", customerID)
+		params.Set("usage", "off_session")
+		params.Set("payment_method_types[0]", "us_bank_account")
+		params.Set("payment_method_options[us_bank_account][verification_method]", "automatic")
+		params.Set("payment_method_options[us_bank_account][financial_connections][permissions][0]", "payment_method")
+		var si struct {
+			ID           string `json:"id"`
+			ClientSecret string `json:"client_secret"`
+		}
+		if err := p.postKey(ctx, "/setup_intents", params, "", &si); err != nil {
+			return processor.Card{}, err
+		}
+		return processor.Card{}, &processor.ActionRequired{ID: si.ID, ClientSecret: si.ClientSecret}
 	}
 	params := url.Values{}
 	params.Set("customer", customerID)
@@ -95,6 +116,11 @@ func (p *Provider) saved(ctx context.Context, customerID, pm string) (processor.
 var errSanctioned = &processor.Answer{Err: processor.NewPaymentError(processor.Stripe, "card_country_unsupported",
 	"cards issued in this country cannot be used here", nil)}
 
+// ReadPaymentMethod reads a Stripe PaymentMethod's card or US bank account facts.
+func (p *Provider) ReadPaymentMethod(ctx context.Context, id string) (processor.Card, error) {
+	return p.card(ctx, id)
+}
+
 // card reads a PaymentMethod's card facts.
 func (p *Provider) card(ctx context.Context, id string) (processor.Card, error) {
 	var pm stripePaymentMethod
@@ -136,6 +162,7 @@ func (p *Provider) FindCustomer(ctx context.Context, reference string) (string, 
 
 type stripePaymentMethod struct {
 	ID   string `json:"id"`
+	Type string `json:"type"`
 	Card struct {
 		Brand       string `json:"brand"`
 		Last4       string `json:"last4"`
@@ -144,10 +171,22 @@ type stripePaymentMethod struct {
 		Fingerprint string `json:"fingerprint"`
 		Country     string `json:"country"`
 	} `json:"card"`
+	USBankAccount struct {
+		BankName    string `json:"bank_name"`
+		Last4       string `json:"last4"`
+		Fingerprint string `json:"fingerprint"`
+	} `json:"us_bank_account"`
 	Customer string `json:"customer"`
 }
 
 func (m stripePaymentMethod) card() processor.Card {
+	if m.Type == "us_bank_account" || (m.Card.Last4 == "" && m.USBankAccount.Last4 != "") {
+		return processor.Card{
+			ID: m.ID, Brand: cmp.Or(strings.TrimSpace(m.USBankAccount.BankName), "Bank account"),
+			Last4: m.USBankAccount.Last4, Fingerprint: m.USBankAccount.Fingerprint,
+			CustomerID: m.Customer, Country: "US",
+		}
+	}
 	return processor.Card{
 		ID: m.ID, Brand: m.Card.Brand, Last4: m.Card.Last4,
 		ExpMonth: m.Card.ExpMonth, ExpYear: m.Card.ExpYear,

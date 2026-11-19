@@ -414,6 +414,48 @@ func metaStr(pm *paymentmethod.PaymentMethod, key string) string {
 	return strings.TrimSpace(v)
 }
 
+// armUnbackedRenewals attaches a newly saved reusable instrument (Square card,
+// Stripe card, or Stripe bank account) to any non-canceled subscription of
+// subject that currently has no recurring instrument on file (e.g., Month 1 was
+// paid via crypto, PayPal, Venmo, or a single-use wallet). Existing card-backed
+// subscriptions on Square or Stripe stay untouched here.
+func armUnbackedRenewals(ctx context.Context, org *organization.Organization, subject string, to *paymentmethod.PaymentMethod) {
+	if org == nil || to == nil || strings.TrimSpace(subject) == "" || strings.TrimSpace(to.ProviderRef) == "" {
+		return
+	}
+	subs, err := ListSubscriptions(ctx, org, subject, "")
+	if err != nil {
+		log.Warn("arm unbacked renewals of %s onto %s: %v", subject, to.Id(), err)
+		return
+	}
+	db := datastore.New(org.Namespaced(ctx))
+	for _, sub := range subs {
+		if sub.Status == subscription.Canceled {
+			continue
+		}
+		held := strings.TrimSpace(sub.DefaultPaymentMethod)
+		unbacked := held == "" || strings.EqualFold(held, "credits")
+		if !unbacked {
+			old := paymentmethod.New(db)
+			if err := old.GetById(held); err == nil && old.Type == stablecoinMethod {
+				unbacked = true
+			}
+		}
+		if !unbacked {
+			continue
+		}
+		live := subscription.New(db)
+		if err := live.GetById(sub.Id()); err != nil {
+			continue
+		}
+		live.DefaultPaymentMethod = to.Id()
+		live.ProviderType = string(providerOf(to))
+		if err := live.Update(); err != nil {
+			log.Error("RECONCILE: subscription %s could not be armed onto method %s: %v", sub.Id(), to.Id(), err)
+		}
+	}
+}
+
 // repointRenewals moves subject's subscriptions that renew on a card of ANOTHER
 // processor onto to, a card saved with the processor the policy takes. It is what
 // makes "a subscription renews on its Square card until its owner saves a Stripe

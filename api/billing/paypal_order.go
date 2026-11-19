@@ -191,7 +191,7 @@ func CreatePayPalOrder(ctx context.Context, org *organization.Organization, in P
 
 		amountCents = chargeCents
 		cur = q.cur
-		intent = "AUTHORIZE"
+		intent = "CAPTURE"
 		desc = fmt.Sprintf("Subscription %s — first period", q.plan.Name)
 		keySeed := in.IdempotencyKey
 		if keySeed == "" {

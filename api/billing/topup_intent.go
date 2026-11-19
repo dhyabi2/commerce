@@ -9,10 +9,12 @@ import (
 
 	"github.com/zap-proto/zip"
 
+	"github.com/hanzoai/commerce/api/promo"
 	"github.com/hanzoai/commerce/billing/engine"
 	"github.com/hanzoai/commerce/datastore"
 	"github.com/hanzoai/commerce/log"
 	"github.com/hanzoai/commerce/middleware"
+	"github.com/hanzoai/commerce/models/checkoutsession"
 	"github.com/hanzoai/commerce/models/organization"
 	"github.com/hanzoai/commerce/models/paymentorg"
 	"github.com/hanzoai/commerce/models/pendingintent"
@@ -22,11 +24,13 @@ import (
 	"github.com/hanzoai/commerce/payment/fx"
 	"github.com/hanzoai/commerce/payment/processor"
 	"github.com/hanzoai/commerce/payment/routing"
+	types "github.com/hanzoai/commerce/types"
 	jsonhttp "github.com/hanzoai/commerce/util/json/http"
 )
 
 // TopupIntentIn is a signed-in buyer opening a Stripe checkout for a top-up of
-// AmountCents US dollars, paying with whatever their country offers.
+// AmountCents US dollars (or a plan's first period when PlanID is non-empty),
+// paying with whatever their country offers.
 type TopupIntentIn struct {
 	Subject        string
 	Country        string
@@ -39,6 +43,13 @@ type TopupIntentIn struct {
 	// Payer is who is paying; the intent is made for their customer, with their
 	// receipt email.
 	Payer PayerIn
+	// Optional plan fields when paying a plan's first period via bank transfer (ACH).
+	PlanID   string
+	Quantity int
+	Level    int
+	Interval types.Interval
+	Coupon   string
+	Promo    *promo.Promo
 }
 
 // TopupIntentOut is what the browser mounts the Payment Element with, and what the
@@ -70,9 +81,53 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 	}
 	// A caller may name the bank debit "ach": the core speaks the policy's name for it.
 	in.Method = policyMethod(in.Method)
-	minCents, maxCents := topupBounds()
-	if in.AmountCents < minCents || in.AmountCents > maxCents {
-		return nil, fault(400, fmt.Sprintf("amountCents must be between %d and %d", minCents, maxCents), nil)
+	planSlug := strings.TrimSpace(in.PlanID)
+	planInterval := types.Monthly
+	if planSlug != "" {
+		db := datastore.New(org.Namespaced(ctx))
+		subIn := SubscribeIn{
+			SourceID: "ach-plan-quote",
+			PlanID:   planSlug,
+			Subject:  in.Subject,
+			Quantity: in.Quantity,
+			Level:    in.Level,
+			Interval: in.Interval,
+			Wallet:   true,
+			Promo:    in.Promo,
+		}
+		q, perr := price(db, org, subIn, planSlug, subIn.SourceID)
+		if perr != nil {
+			return nil, saleErrToFault(perr)
+		}
+		planSlug = q.slug
+		planInterval = q.plan.Interval
+		chargeCents := q.charge
+		if raw := strings.TrimSpace(in.Coupon); raw != "" {
+			couponCode := promo.CouponCode(raw)
+			if couponCode == "" || !engine.BillsMonthly(q.plan) {
+				return nil, fault(400, "coupon is not valid for this plan", nil)
+			}
+			offer, reason := promo.FindCoupon(ctx, couponCode, time.Now())
+			if reason == "" && !everyLine(q.slug, q.lines, offer.AppliesTo) {
+				reason = promo.CouponNotApplicable
+			}
+			if reason != "" {
+				return nil, fault(400, couponRefusal(couponCode, q.slug, reason), nil)
+			}
+			if promo.Redeemed(ctx, couponCode, org.Name) {
+				return nil, fault(409, fmt.Sprintf("%v (%s)", promo.ErrCouponRedeemedByOrg, couponCode), nil)
+			}
+			chargeCents = engine.Discounted(chargeCents, offer.Coupon().Percent)
+			if chargeCents <= 0 {
+				return nil, fault(400, "coupon leaves nothing to charge", nil)
+			}
+		}
+		in.AmountCents = chargeCents
+	} else {
+		minCents, maxCents := topupBounds()
+		if in.AmountCents < minCents || in.AmountCents > maxCents {
+			return nil, fault(400, fmt.Sprintf("amountCents must be between %d and %d", minCents, maxCents), nil)
+		}
 	}
 	d, f := Place(ctx, org, RouteIn{Subject: in.Subject, Country: in.Country, Method: in.Method, Currency: in.Currency})
 	if f != nil {
@@ -170,10 +225,11 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 		}
 	}
 	// The payer's one customer at Stripe, named and addressed, so the issuer and Radar
-	// see a person and not an anonymous buyer.
+	// see a person and not an anonymous buyer — and required when vaulting a bank debit
+	// for recurring plan renewals.
 	payer := payerFor(org, in.Subject, in.Payer)
 	customer := ""
-	if cv, ok := sp.(cardVault); ok && payer.Known() {
+	if cv, ok := sp.(cardVault); ok && (payer.Known() || planSlug != "") {
 		if id, cerr := vaultCustomer(ctx, datastore.New(org.Namespaced(ctx)), cv, in.Subject, payer); cerr != nil {
 			log.Warn("topup intent: no customer for %s: %v", in.Subject, cerr)
 		} else {
@@ -207,13 +263,24 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 		}
 		only = []string{"us_bank_account"}
 	}
+	desc := fmt.Sprintf("Top-up %d usd for %s", in.AmountCents, in.Subject)
+	if planSlug != "" {
+		desc = fmt.Sprintf("Subscription %s — first period for %s", planSlug, in.Subject)
+	}
 	out, err := maker.CreateLocalIntent(ctx, processor.LocalIntent{
-		Only:     only,
-		Customer: customer, ReceiptEmail: payer.Email, Verification: verification,
-		Amount: paid, Currency: cur, Excluded: excluded, Configuration: walletConfig, QuoteID: quote.QuoteID,
-		Key:      gatewayKey("topup-local", in.Subject, fmt.Sprintf("%s:%d", key, paid)),
-		Desc:     fmt.Sprintf("Top-up %d usd for %s", in.AmountCents, in.Subject),
-		Metadata: map[string]interface{}{"hanzo_subject": in.Subject, "hanzo_usd_cents": in.AmountCents, "hanzo_org": org.Name, "org": org.Name, "user": strings.ToLower(in.Subject)},
+		Only:              only,
+		Customer:          customer,
+		ReceiptEmail:      payer.Email,
+		Verification:      verification,
+		SaveForOffSession: planSlug != "" && customer != "",
+		Amount:            paid,
+		Currency:          cur,
+		Excluded:          excluded,
+		Configuration:     walletConfig,
+		QuoteID:           quote.QuoteID,
+		Key:               gatewayKey("topup-local", in.Subject, fmt.Sprintf("%s:%d:%s", key, paid, planSlug)),
+		Desc:              desc,
+		Metadata:          map[string]interface{}{"hanzo_subject": in.Subject, "hanzo_usd_cents": in.AmountCents, "hanzo_org": org.Name, "org": org.Name, "user": strings.ToLower(in.Subject)},
 	})
 	if err != nil {
 		return nil, fault(502, "the payment could not be opened", err)
@@ -222,7 +289,25 @@ func OpenTopupIntent(ctx context.Context, org *organization.Organization, in Top
 	if cur == "usd" {
 		paidCents, paidCur = 0, ""
 	}
-	if perr := pendingintent.PutQuoted(out.ID, org.Name, strings.ToLower(in.Subject), pendingintent.Topup, in.AmountCents, "usd", paidCents, paidCur, polVersion, org.TestMode()); perr != nil {
+	if planSlug != "" {
+		sess := new(checkoutsession.Session)
+		sess.SetId(newSessionID())
+		sess.Org, sess.Subject, sess.Test, sess.Status = org.Name, strings.ToLower(in.Subject), org.TestMode(), checkoutsession.Pending
+		sess.Line, sess.Plan, sess.Interval, sess.TotalCents, sess.Intent = checkoutsession.Plan, planSlug, string(planInterval), in.AmountCents, out.ID
+		if serr := checkoutsession.Put(sess); serr != nil {
+			if c, ok := sp.(interface{ CancelIntent(context.Context, string) error }); ok {
+				_ = c.CancelIntent(ctx, out.ID)
+			}
+			return nil, fault(503, "billing is temporarily unavailable; please retry", serr)
+		}
+		if perr := pendingintent.PutRef(out.ID, org.Name, strings.ToLower(in.Subject), pendingintent.Plan, sess.Id(), in.AmountCents, "usd", org.TestMode()); perr != nil {
+			if c, ok := sp.(interface{ CancelIntent(context.Context, string) error }); ok {
+				_ = c.CancelIntent(ctx, out.ID)
+			}
+			return nil, fault(503, "billing is temporarily unavailable; please retry", perr)
+		}
+		_ = pendingintent.Bind(out.ID, pendingintent.Terms{Delayed: true})
+	} else if perr := pendingintent.PutQuoted(out.ID, org.Name, strings.ToLower(in.Subject), pendingintent.Topup, in.AmountCents, "usd", paidCents, paidCur, polVersion, org.TestMode()); perr != nil {
 		// Without the record the payment could not be attributed. Cancel it rather than
 		// hand the buyer a secret whose money nobody could place.
 		if c, ok := sp.(interface {
@@ -268,6 +353,8 @@ type TopupIntentState struct {
 	// PaymentID is the receipt of the credit, set once Credited: the transaction the
 	// wallet's credit was written as.
 	PaymentID string `json:"paymentId,omitempty"`
+	// SubscriptionID is set when a plan-bound bank transfer intent settles and opens a plan.
+	SubscriptionID string `json:"subscriptionId,omitempty"`
 }
 
 // ReadTopupIntent answers where one of the caller's own payments is. A payment that
@@ -289,6 +376,14 @@ func ReadTopupIntent(ctx context.Context, org *organization.Organization, subjec
 		return nil, fault(502, "the payment could not be read", err)
 	}
 	out := &TopupIntentState{State: processor.IntentState(tx.Status)}
+	if p.Purpose == pendingintent.Plan {
+		if s, ok, _ := checkoutsession.Get(p.Ref); ok && s.SubscriptionID != "" {
+			out.Credited = true
+			out.SubscriptionID = s.SubscriptionID
+			out.PaymentID = s.PaymentID
+			return out, nil
+		}
+	}
 	if tx.ProcessorRef != "" {
 		_, out.Credited, _ = paymentorg.Get(tx.ProcessorRef)
 		if out.Credited {
@@ -303,10 +398,15 @@ func ReadTopupIntent(ctx context.Context, org *organization.Organization, subjec
 }
 
 type topupIntentRequest struct {
-	AmountCents int64  `json:"amountCents"`
-	Country     string `json:"country"`
-	Currency    string `json:"currency"`
-	Method      string `json:"method"`
+	AmountCents int64          `json:"amountCents"`
+	Country     string         `json:"country"`
+	Currency    string         `json:"currency"`
+	Method      string         `json:"method"`
+	PlanID      string         `json:"planId,omitempty"`
+	Quantity    int            `json:"quantity,omitempty"`
+	Level       int            `json:"level,omitempty"`
+	Interval    types.Interval `json:"interval,omitempty"`
+	Coupon      string         `json:"coupon,omitempty"`
 }
 
 // CreateTopupIntent opens a Stripe checkout for a top-up.
@@ -330,6 +430,8 @@ func CreateTopupIntent(c *zip.Ctx) error {
 		Currency: strings.TrimSpace(req.Currency), Method: req.Method,
 		IdempotencyKey: strings.TrimSpace(c.Header("X-Idempotency-Key")),
 		Payer:          PayerIn{Email: iamEmail(c)},
+		PlanID:         req.PlanID, Quantity: req.Quantity, Level: req.Level, Interval: req.Interval, Coupon: req.Coupon,
+		Promo: promo.Active(c),
 	})
 	if f != nil {
 		return jsonhttp.Fail(c, f.Status, f.Message, f.Err)

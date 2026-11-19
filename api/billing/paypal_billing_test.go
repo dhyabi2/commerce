@@ -75,31 +75,23 @@ func newMockPayPalServer(t *testing.T) *httptest.Server {
 			}},
 		})
 	})
-	mux.HandleFunc("/v2/checkout/orders/PP-ORD-SUB-1/authorize", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2/checkout/orders/PP-ORD-SUB-1/capture", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":     "PP-ORD-SUB-1",
 			"status": "COMPLETED",
 			"payment_source": map[string]any{
-				"card": map[string]any{"brand": "VISA", "last_digits": "1881", "expiry": "2029-05"},
+				"venmo": map[string]any{"user_name": "alice-venmo"},
 			},
 			"purchase_units": []map[string]any{{
 				"payments": map[string]any{
-					"authorizations": []map[string]any{{
-						"id":     "PP-AUTH-SUB-1",
-						"status": "CREATED",
+					"captures": []map[string]any{{
+						"id":     "PP-CAP-SUB-1",
+						"status": "COMPLETED",
 						"amount": map[string]string{"currency_code": "USD", "value": "20.00"},
 					}},
 				},
 			}},
-		})
-	})
-	mux.HandleFunc("/v2/payments/authorizations/PP-AUTH-SUB-1/capture", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":     "PP-CAP-SUB-1",
-			"status": "COMPLETED",
-			"amount": map[string]string{"currency_code": "USD", "value": "20.00"},
 		})
 	})
 	mux.HandleFunc("/v1/notifications/verify-webhook-signature", func(w http.ResponseWriter, r *http.Request) {
@@ -219,7 +211,7 @@ func TestPayPal_CreateOrderTopupSubscribeAndWebhooks(t *testing.T) {
 		t.Fatalf("host settle credit: %v", err)
 	}
 
-	// 3. CreatePayPalOrder + Subscribe with Provider="paypal" (AUTHORIZE -> Capture -> Subscription).
+	// 3. CreatePayPalOrder + Subscribe with Provider="paypal" (CAPTURE -> Subscription, supporting Venmo & PayPal).
 	subOrder, sf := CreatePayPalOrder(ctx, org, PayPalOrderIn{
 		PlanID:         "dev-paypal",
 		Subject:        "hanzo/alice",
@@ -228,7 +220,7 @@ func TestPayPal_CreateOrderTopupSubscribeAndWebhooks(t *testing.T) {
 	if sf != nil {
 		t.Fatalf("CreatePayPalOrder sub: %v", sf)
 	}
-	if subOrder.Intent != "AUTHORIZE" || subOrder.AmountCents != 2000 {
+	if subOrder.Intent != "CAPTURE" || subOrder.AmountCents != 2000 {
 		t.Fatalf("unexpected sub order: %+v", subOrder)
 	}
 

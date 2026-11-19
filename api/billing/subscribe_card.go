@@ -2020,6 +2020,15 @@ func chargeProvider(org *organization.Organization, buyerPresent bool) engine.Pr
 			}
 		}
 		if err != nil || res == nil || !res.Success {
+			if res != nil && res.Status == "processing" && res.TransactionID != "" && providerOf(pm) == processor.Stripe {
+				// An off-session bank debit (ACH) starts in "processing" and settles 1–3 business
+				// days later via webhook (finishInvoiceDeposit). Record it as delayed so the sweep
+				// waits rather than charging a second time.
+				if perr := pendingintent.PutRef(res.TransactionID, org.Name, strings.ToLower(inv.UserId), pendingintent.Invoice, inv.Id(), amountCents, string(cur), org.TestMode()); perr == nil {
+					_ = pendingintent.Bind(res.TransactionID, pendingintent.Terms{Delayed: true})
+					return "", errWaitingOnBuyer
+				}
+			}
 			if pm.Type == agentToken {
 				// A token that cannot cover the renewal (expired, revoked, over its limit, or not
 				// recurring) leaves the invoice open and the subscription past due, and says how

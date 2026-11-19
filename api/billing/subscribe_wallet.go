@@ -58,6 +58,7 @@ import (
 
 // walletRail is a processor that can hold a payment, take it, or let it go.
 type walletRail interface {
+	Charge(ctx context.Context, req processor.PaymentRequest) (*processor.PaymentResult, error)
 	Authorize(ctx context.Context, req processor.PaymentRequest) (*processor.PaymentResult, error)
 	Capture(ctx context.Context, transactionID string, amount money.Amount) (*processor.PaymentResult, error)
 	CancelAuthorization(ctx context.Context, paymentID string) error
@@ -212,42 +213,6 @@ func walletSale(ctx context.Context, db *datastore.Datastore, org *organization.
 		IdempotencyKey: gatewayKey("subscribe-wallet", in.Subject, t.guard+":"+tokenTag(t.sourceID)),
 		Description:    fmt.Sprintf("Subscription %s — first period", t.plan.Name),
 	}
-	authorize := func() (*processor.PaymentResult, error) {
-		c, cancel := context.WithTimeout(work, walletWait)
-		defer cancel()
-		return wr.Authorize(c, req)
-	}
-	auth, err := authorize()
-	if err != nil && !answered(err) {
-		// No answer. The same key again is answered with the first call's result,
-		// so this either finds the hold the first call made or makes the only one.
-		auth, err = authorize()
-	}
-	switch {
-	case err == nil && auth != nil && auth.Success:
-	case err == nil || answered(err):
-		// Square said no: nothing is held.
-		t.abandon()
-		log.Error("wallet authorization declined for subscribe (subject=%s): %v", in.Subject, err)
-		return nil, saleRefusal{saleDeclined, parseCardDeclineReason(auth, err)}
-	default:
-		// Still no answer: a hold may exist that this attempt cannot name. The guard
-		// stays held so a retry waits out the attempt rather than holding twice.
-		log.Error("RECONCILE: a wallet authorization for subscribe went unanswered twice (subject=%s attempt=%s): %v",
-			in.Subject, t.guard, err)
-		return nil, saleRefusal{saleUnavailable, "the wallet could not be reached, and nothing was taken; try again in a few minutes"}
-	}
-	// void lets the authorization go, and says whether Square confirmed it.
-	void := func() bool {
-		c, cancel := context.WithTimeout(work, walletWait)
-		defer cancel()
-		if verr := wr.CancelAuthorization(c, auth.ProcessorRef); verr != nil {
-			log.Error("subscribe: wallet authorization %s was not voided (subject=%s): %v",
-				auth.ProcessorRef, in.Subject, verr)
-			return false
-		}
-		return true
-	}
 	// unsettled is the end of an attempt Square may have taken money for: sealed,
 	// named for reconciliation, and told plainly.
 	unsettled := func(ref, why string) error {
@@ -257,49 +222,139 @@ func walletSale(ctx context.Context, db *datastore.Datastore, org *organization.
 			"the wallet payment %s could not be confirmed and nothing more will be charged for it; it is being reconciled", ref)}
 	}
 
-	// The coupon's use, reserved against the card behind the wallet under the
-	// coupon's lock, exactly as a typed card's is: an org or a card that has used
-	// the code is refused here, before anything is taken.
-	var hold *promo.Hold
-	if t.coupon.Code != "" {
-		card := walletCard(auth)
-		if card == "" {
-			void()
-			t.abandon()
-			return nil, saleRefusal{saleRefused, fmt.Sprintf(
-				"coupon %s is redeemed with a card, Apple Pay or Google Pay, and this wallet names no card", t.coupon.Code)}
+	var (
+		auth *processor.PaymentResult
+		res  *processor.PaymentResult
+		hold *promo.Hold
+		err  error
+	)
+	if strings.EqualFold(strings.TrimSpace(in.Provider), string(processor.PayPal)) {
+		// PayPal & Venmo plan orders open with intent CAPTURE (Venmo requires CAPTURE
+		// in PayPal Orders v2). Reserve any coupon before capturing the approved order;
+		// fall back to Authorize+Capture only for an in-flight AUTHORIZE order.
+		if t.coupon.Code != "" {
+			h, herr := promo.Reserve(work, t.coupon.Code, org.Name, "paypal:"+in.Subject, time.Now())
+			if herr != nil {
+				t.abandon()
+				return nil, holdRefusal(t.coupon.Code, herr)
+			}
+			hold = h
 		}
-		h, herr := promo.Reserve(work, t.coupon.Code, org.Name, card, time.Now())
-		if herr != nil {
-			void()
-			t.abandon()
-			return nil, holdRefusal(t.coupon.Code, herr)
+		capture := func() (*processor.PaymentResult, error) {
+			c, cancel := context.WithTimeout(work, walletWait)
+			defer cancel()
+			return wr.Charge(c, req)
 		}
-		hold = h
-	}
+		res, err = capture()
+		if err != nil && !answered(err) {
+			res, err = capture()
+		}
+		if err != nil && answered(err) {
+			// Legacy AUTHORIZE order in flight during deploy rollover: authorize + capture.
+			c, cancel := context.WithTimeout(work, walletWait)
+			a, aerr := wr.Authorize(c, req)
+			cancel()
+			if aerr == nil && a != nil && a.Success {
+				auth = a
+				c2, cancel2 := context.WithTimeout(work, walletWait)
+				res, err = wr.Capture(c2, a.ProcessorRef, money.Amount{})
+				cancel2()
+			}
+		}
+		switch {
+		case err == nil && res != nil && res.Success:
+			if auth == nil {
+				auth = res
+			}
+		case err == nil || answered(err):
+			hold.Release()
+			t.abandon()
+			log.Error("paypal capture declined for subscribe (subject=%s): %v", in.Subject, err)
+			return nil, saleRefusal{saleDeclined, parseCardDeclineReason(res, err)}
+		default:
+			return nil, unsettled(t.sourceID, fmt.Sprintf("paypal order %s capture went unanswered: %v", t.sourceID, err))
+		}
+	} else {
+		authorize := func() (*processor.PaymentResult, error) {
+			c, cancel := context.WithTimeout(work, walletWait)
+			defer cancel()
+			return wr.Authorize(c, req)
+		}
+		auth, err = authorize()
+		if err != nil && !answered(err) {
+			// No answer. The same key again is answered with the first call's result,
+			// so this either finds the hold the first call made or makes the only one.
+			auth, err = authorize()
+		}
+		switch {
+		case err == nil && auth != nil && auth.Success:
+		case err == nil || answered(err):
+			// Square said no: nothing is held.
+			t.abandon()
+			log.Error("wallet authorization declined for subscribe (subject=%s): %v", in.Subject, err)
+			return nil, saleRefusal{saleDeclined, parseCardDeclineReason(auth, err)}
+		default:
+			// Still no answer: a hold may exist that this attempt cannot name. The guard
+			// stays held so a retry waits out the attempt rather than holding twice.
+			log.Error("RECONCILE: a wallet authorization for subscribe went unanswered twice (subject=%s attempt=%s): %v",
+				in.Subject, t.guard, err)
+			return nil, saleRefusal{saleUnavailable, "the wallet could not be reached, and nothing was taken; try again in a few minutes"}
+		}
+		// void lets the authorization go, and says whether Square confirmed it.
+		void := func() bool {
+			c, cancel := context.WithTimeout(work, walletWait)
+			defer cancel()
+			if verr := wr.CancelAuthorization(c, auth.ProcessorRef); verr != nil {
+				log.Error("subscribe: wallet authorization %s was not voided (subject=%s): %v",
+					auth.ProcessorRef, in.Subject, verr)
+				return false
+			}
+			return true
+		}
 
-	c, cancel := context.WithTimeout(work, walletWait)
-	res, err := wr.Capture(c, auth.ProcessorRef, money.Amount{})
-	cancel()
-	state := settledTaken
-	switch {
-	case err == nil && res != nil && res.Success:
-	case err == nil && res != nil && void():
-		// Square answered and did not take it, and the hold is let go.
-		state = settledReleased
-	default:
-		// No answer, or a hold that would not let go: read it back.
-		state = settle(work, wr, auth.ProcessorRef)
-	}
-	switch state {
-	case settledReleased:
-		hold.Release()
-		t.abandon()
-		return nil, saleRefusal{saleDeclined, parseCardDeclineReason(res, nil)}
-	case settledUnknown:
-		// The coupon's use stays spent with the payment it may have paid for.
-		return nil, unsettled(auth.ProcessorRef, fmt.Sprintf(
-			"a wallet payment's capture was not confirmed and no subscription was opened: %v", err))
+		// The coupon's use, reserved against the card behind the wallet under the
+		// coupon's lock, exactly as a typed card's is: an org or a card that has used
+		// the code is refused here, before anything is taken.
+		if t.coupon.Code != "" {
+			card := walletCard(auth)
+			if card == "" {
+				void()
+				t.abandon()
+				return nil, saleRefusal{saleRefused, fmt.Sprintf(
+					"coupon %s is redeemed with a card, Apple Pay or Google Pay, and this wallet names no card", t.coupon.Code)}
+			}
+			h, herr := promo.Reserve(work, t.coupon.Code, org.Name, card, time.Now())
+			if herr != nil {
+				void()
+				t.abandon()
+				return nil, holdRefusal(t.coupon.Code, herr)
+			}
+			hold = h
+		}
+
+		c, cancel := context.WithTimeout(work, walletWait)
+		res, err = wr.Capture(c, auth.ProcessorRef, money.Amount{})
+		cancel()
+		state := settledTaken
+		switch {
+		case err == nil && res != nil && res.Success:
+		case err == nil && res != nil && void():
+			// Square answered and did not take it, and the hold is let go.
+			state = settledReleased
+		default:
+			// No answer, or a hold that would not let go: read it back.
+			state = settle(work, wr, auth.ProcessorRef)
+		}
+		switch state {
+		case settledReleased:
+			hold.Release()
+			t.abandon()
+			return nil, saleRefusal{saleDeclined, parseCardDeclineReason(res, nil)}
+		case settledUnknown:
+			// The coupon's use stays spent with the payment it may have paid for.
+			return nil, unsettled(auth.ProcessorRef, fmt.Sprintf(
+				"a wallet payment's capture was not confirmed and no subscription was opened: %v", err))
+		}
 	}
 	ref := auth.ProcessorRef
 	if res != nil && res.ProcessorRef != "" {

@@ -204,15 +204,55 @@ func finishPlanDeposit(ctx context.Context, org *organization.Organization, p *p
 		return fail(fmt.Errorf("the checkout a deposit pays could not be read: %v", err))
 	}
 	db := datastore.New(org.Namespaced(ctx))
-	pm, err := depositMethod(db, s.Subject)
-	if err != nil {
-		return fail(err)
+	var pm *paymentmethod.PaymentMethod
+	source := "agent/stablecoin"
+	// If the settled PaymentIntent attached a reusable Stripe PaymentMethod (such as
+	// an ACH us_bank_account with setup_future_usage=off_session), record and attach
+	// it so renewals auto-debit that bank account instead of waiting on a deposit.
+	if sp, serr := processorsForOrg(org).Existing(ctx, processor.Stripe); serr == nil {
+		if tx, terr := sp.GetTransaction(ctx, p.Id()); terr == nil && tx != nil {
+			pmRef, _ := tx.Metadata["payment_method"].(string)
+			if strings.HasPrefix(pmRef, "pm_") && tx.CustomerID != "" {
+				var card processor.Card
+				if r, ok := sp.(interface {
+					ReadPaymentMethod(context.Context, string) (processor.Card, error)
+				}); ok {
+					card, _ = r.ReadPaymentMethod(ctx, pmRef)
+				}
+				if match := duplicateOf(db, s.Subject, card); match != nil {
+					pm = match
+				} else {
+					saved := paymentmethod.New(db)
+					saved.CustomerId, saved.UserId = s.Subject, s.Subject
+					saved.Type = "card"
+					saved.ProviderRef, saved.ProviderType = pmRef, string(processor.Stripe)
+					saved.Metadata = map[string]interface{}{"customerId": tx.CustomerID, "cardId": pmRef, "verified": true}
+					stampCard(saved, card)
+					if saved.Create() == nil {
+						pm = saved
+					}
+				}
+				if pm != nil {
+					source = "subscribe/ach"
+				}
+			}
+		}
+	}
+	if pm == nil {
+		pm, err = depositMethod(db, s.Subject)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	pl, err := resolveSubscriptionPlan(db, s.Plan)
 	if err != nil {
 		return fail(err)
 	}
-	if pl, err = planAt(pl, 0, types.Monthly); err != nil {
+	interval := types.Monthly
+	if s.Interval == string(types.Yearly) || s.Interval == "year" {
+		interval = types.Yearly
+	}
+	if pl, err = planAt(pl, 0, interval); err != nil {
 		return fail(err)
 	}
 	lines, err := linesAt(db, pl, nil, pl.Interval, currency.USD)
@@ -221,13 +261,25 @@ func finishPlanDeposit(ctx context.Context, org *organization.Organization, p *p
 	}
 	sub, err := createSubscription(db, pl, &createSubscriptionRequest{
 		UserId: s.Subject, PlanId: s.Plan, DefaultPaymentMethod: pm.Id(), Quantity: 1,
-		Metadata: map[string]interface{}{"source": "agent/stablecoin", "payment": p.Id()}, Test: org.TestMode(), priced: lines,
+		Metadata: map[string]interface{}{"source": source, "payment": p.Id()}, Test: org.TestMode(), priced: lines,
 	})
 	if err != nil {
 		return fail(err)
 	}
+	if source == "subscribe/ach" {
+		sub.ProviderType = string(processor.Stripe)
+		_ = sub.Update()
+	}
+	ref := charge
+	if ref == "" {
+		ref = p.Id()
+	}
+	invID := ""
+	if inv, ierr := engine.CreatePaidFirstInvoice(db, sub, source, ref); ierr == nil && inv != nil {
+		invID = inv.Id()
+	}
 	if charge != "" {
-		if err := paymentorg.Put(charge, org.Name, s.Subject, "", 0, org.TestMode()); err != nil {
+		if err := paymentorg.Put(charge, org.Name, s.Subject, invID, 0, org.TestMode()); err != nil {
 			log.Warn("plan deposit %s: the payment index was not written: %v", p.Id(), err)
 		}
 	}

@@ -40,6 +40,9 @@ type LocalIntent struct {
 	// instant verification through the bank's login (Financial Connections) and microdeposits
 	// when the bank is not covered. "" leaves the processor's own default.
 	Verification string
+	// SaveForOffSession attaches the confirmed PaymentMethod (e.g. us_bank_account) to
+	// Customer for future off-session subscription renewals.
+	SaveForOffSession bool
 }
 
 // Capable is a processor that can say which payment methods its account takes now (not

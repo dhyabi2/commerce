@@ -30,6 +30,17 @@ import (
 // GPUs. TestDepositTag_IsRealMoney pins this.
 const depositTag = "crypto-deposit"
 
+// PlanActivator opens a plan subscription paid by a confirmed crypto deposit,
+// returning the opened subscription ID and the cents consumed by the plan's
+// first period. Any remainder above consumedCents is credited to the wallet.
+type PlanActivator func(ctx context.Context, orgName, subject string, intent *cryptopaymentintent.CryptoPaymentIntent, depositedCents int64, txHash string) (subID string, consumedCents int64, err error)
+
+var planActivator PlanActivator
+
+// SetPlanActivator registers the callback that activates plan subscriptions when
+// a plan-bound crypto deposit confirms on-chain.
+func SetPlanActivator(fn PlanActivator) { planActivator = fn }
+
 // intentStore is the production depositwatch.Store: per-org deposit intents on
 // one side, the commerce transaction ledger on the other.
 type intentStore struct{}
@@ -222,28 +233,70 @@ func (intentStore) Credit(ctx context.Context, c depositwatch.Credit) (bool, err
 	key := creditKey(db, c.DedupKey)
 	existing := transaction.New(db)
 	amount := c.AmountCents
+	alreadySubID := ""
+	var alreadyConsumed int64
 	switch err := existing.Get(key); {
 	case err == nil:
 		amount = int64(existing.Amount)
+		if existing.Metadata != nil {
+			alreadySubID, _ = existing.Metadata["subscriptionId"].(string)
+			switch v := existing.Metadata["planConsumedCents"].(type) {
+			case float64:
+				alreadyConsumed = int64(v)
+			case int64:
+				alreadyConsumed = v
+			}
+		}
 	case errors.Is(err, datastore.ErrNoSuchEntity):
 	default:
 		// Cannot tell a first credit from a repeat: refuse rather than risk
 		// either double-crediting or losing the deposit.
 		return false, fmt.Errorf("depositledger: check existing credit %s: %w", c.DedupKey, err)
 	}
-	if led := creditledger.Get(); led != nil {
-		if _, _, err := led.Credit(ctx, creditledger.CreditInput{
-			Org:            strings.ToLower(strings.TrimSpace(c.Org)),
-			Subject:        c.Subject,
-			Currency:       "usd",
-			Reason:         fmt.Sprintf("crypto deposit %s %s on %s (%s)", c.Units, strings.ToUpper(c.Token), c.Chain, c.TxHash),
-			Tag:            depositTag,
-			IdempotencyKey: depositTag + ":" + c.DedupKey,
-			AmountCents:    amount,
-			Test:           c.Test,
-			Cash:           true, // the customer's own confirmed on-chain transfer
-		}); err != nil {
-			return false, fmt.Errorf("depositledger: fund %s: %w", c.DedupKey, err)
+
+	subID := alreadySubID
+	consumed := alreadyConsumed
+	if subID == "" && planActivator != nil && c.IntentID != "" {
+		in := cryptopaymentintent.New(db)
+		if err := in.GetById(c.IntentID); err == nil && in.Metadata != nil {
+			if existingSub, _ := in.Metadata["subscriptionId"].(string); existingSub != "" {
+				subID = existingSub
+				switch v := in.Metadata["chargeCents"].(type) {
+				case float64:
+					consumed = int64(v)
+				case int64:
+					consumed = v
+				}
+			} else if pid, _ := in.Metadata["planId"].(string); strings.TrimSpace(pid) != "" {
+				openedSub, used, perr := planActivator(ctx, c.Org, c.Subject, in, amount, c.TxHash)
+				if perr != nil {
+					return false, fmt.Errorf("depositledger: activate plan %s for %s: %w", pid, c.DedupKey, perr)
+				}
+				if openedSub != "" {
+					subID, consumed = openedSub, used
+					in.Metadata["subscriptionId"] = openedSub
+					_ = in.Update()
+				}
+			}
+		}
+	}
+
+	walletCredit := amount - consumed
+	if walletCredit > 0 {
+		if led := creditledger.Get(); led != nil {
+			if _, _, err := led.Credit(ctx, creditledger.CreditInput{
+				Org:            strings.ToLower(strings.TrimSpace(c.Org)),
+				Subject:        c.Subject,
+				Currency:       "usd",
+				Reason:         fmt.Sprintf("crypto deposit %s %s on %s (%s)", c.Units, strings.ToUpper(c.Token), c.Chain, c.TxHash),
+				Tag:            depositTag,
+				IdempotencyKey: depositTag + ":" + c.DedupKey,
+				AmountCents:    walletCredit,
+				Test:           c.Test,
+				Cash:           true, // the customer's own confirmed on-chain transfer
+			}); err != nil {
+				return false, fmt.Errorf("depositledger: fund %s: %w", c.DedupKey, err)
+			}
 		}
 	}
 	written := false
@@ -279,6 +332,10 @@ func (intentStore) Credit(ctx context.Context, c depositwatch.Credit) (bool, err
 			"units":         c.Units,
 			"rate":          c.PegRate,
 			"intentId":      c.IntentID,
+		}
+		if subID != "" {
+			trans.Metadata["subscriptionId"] = subID
+			trans.Metadata["planConsumedCents"] = consumed
 		}
 		// The value being mirrored was created by a customer's own on-chain
 		// transfer into a custody address we minted — a settled, external fact,

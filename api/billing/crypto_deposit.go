@@ -11,36 +11,54 @@ import (
 
 	"github.com/zap-proto/zip"
 
+	"github.com/hanzoai/commerce/api/promo"
 	"github.com/hanzoai/commerce/billing/depositledger"
 	"github.com/hanzoai/commerce/billing/depositwatch"
+	"github.com/hanzoai/commerce/billing/engine"
 	"github.com/hanzoai/commerce/billing/gateway"
 	"github.com/hanzoai/commerce/datastore"
+	"github.com/hanzoai/commerce/log"
 	"github.com/hanzoai/commerce/middleware"
 	"github.com/hanzoai/commerce/models/cryptopaymentintent"
 	"github.com/hanzoai/commerce/models/organization"
+	"github.com/hanzoai/commerce/models/paymentorg"
+	"github.com/hanzoai/commerce/models/subscription"
+	"github.com/hanzoai/commerce/models/types/currency"
 	"github.com/hanzoai/commerce/payment/processor"
+	orgpkg "github.com/hanzoai/commerce/pkg/org"
+	types "github.com/hanzoai/commerce/types"
 	jsonhttp "github.com/hanzoai/commerce/util/json/http"
 )
 
-// The native crypto top-up rail: a per-payer MPC custody deposit address.
-//
-// Address generation is the MPC signer's (processor.MPC — Hanzo KMS control
-// plane + MPC signing backend); commerce holds NO key material and can only
-// REQUEST an address, exactly like the HUSD treasury split. Crediting the
-// balance is the chain watcher's job on real confirmations — nothing here
-// mints, so a claimed deposit is worth nothing until the chain says otherwise.
-//
-// The supported chain/token set is served live from the processor
-// (GET /v1/billing/crypto/options), so when the MPC service grows a chain
-// (TON, XRP, …) it appears on every pay surface with no client change.
+func init() {
+	depositledger.SetPlanActivator(activateCryptoPlan)
+}
+
+// CryptoPlanIn describes an optional plan purchase attached to a crypto deposit.
+// When PlanID is non-empty, the deposit's amount is set to the server-authoritative
+// catalog price (less active promo and validated coupon), and confirming the deposit
+// opens the plan's first period automatically.
+type CryptoPlanIn struct {
+	PlanID   string         `json:"planId,omitempty"`
+	Quantity int            `json:"quantity,omitempty"`
+	Level    int            `json:"level,omitempty"`
+	Interval types.Interval `json:"interval,omitempty"`
+	Coupon   string         `json:"coupon,omitempty"`
+	Promo    *promo.Promo   `json:"-"`
+}
 
 // cryptoDepositRequest is the wire body. There is deliberately NO subject
 // field: the credited payer is the caller's own billing identity, so a body
 // value cannot steer where a deposit lands.
 type cryptoDepositRequest struct {
-	Chain       string `json:"chain,omitempty"` // default "ethereum"
-	Token       string `json:"token,omitempty"` // default "usdc"
-	AmountCents int64  `json:"amountCents,omitempty"`
+	Chain       string         `json:"chain,omitempty"` // default "ethereum"
+	Token       string         `json:"token,omitempty"` // default "usdc"
+	AmountCents int64          `json:"amountCents,omitempty"`
+	PlanID      string         `json:"planId,omitempty"`
+	Quantity    int            `json:"quantity,omitempty"`
+	Level       int            `json:"level,omitempty"`
+	Interval    types.Interval `json:"interval,omitempty"`
+	Coupon      string         `json:"coupon,omitempty"`
 }
 
 // CryptoDeposit is a payer's destination and what has become of it — where to
@@ -94,6 +112,10 @@ type CryptoDeposit struct {
 	// cents, once it succeeded. A later transfer to the same address is credited
 	// by its own row and is not summed here.
 	CreditedCents int64 `json:"creditedCents,omitempty"`
+
+	// PlanID and SubscriptionID are set when the deposit pays a plan's first period.
+	PlanID         string `json:"planId,omitempty"`
+	SubscriptionID string `json:"subscriptionId,omitempty"`
 }
 
 // CryptoOptions is the menu of what the crypto rails accept. Chains, Tokens
@@ -665,11 +687,196 @@ func CreateCryptoDeposit(ctx context.Context, org *organization.Organization, pa
 	return toCryptoDepositResponse(intent), nil
 }
 
+// CreateCryptoDepositForPlan opens a crypto deposit address priced from the plan
+// catalog so an on-chain confirmation opens the plan's first period automatically.
+func CreateCryptoDepositForPlan(ctx context.Context, org *organization.Organization, payer, chain, token string, amountCents int64, planIn CryptoPlanIn) (CryptoDeposit, error) {
+	if strings.TrimSpace(planIn.PlanID) == "" {
+		return CreateCryptoDeposit(ctx, org, payer, chain, token, amountCents)
+	}
+	if org == nil {
+		return CryptoDeposit{}, errors.New("crypto deposit: no organization")
+	}
+	if payer == "" {
+		return CryptoDeposit{}, errors.New("crypto deposit: no payer")
+	}
+	db := datastore.New(org.Namespaced(ctx))
+	subIn := SubscribeIn{
+		SourceID: "crypto-plan-quote",
+		PlanID:   strings.TrimSpace(planIn.PlanID),
+		Subject:  payer,
+		Quantity: planIn.Quantity,
+		Level:    planIn.Level,
+		Interval: planIn.Interval,
+		Wallet:   true,
+		Promo:    planIn.Promo,
+	}
+	q, perr := price(db, org, subIn, subIn.PlanID, subIn.SourceID)
+	if perr != nil {
+		return CryptoDeposit{}, depositValidationError{perr.Error()}
+	}
+	chargeCents := q.charge
+	couponCode := ""
+	if raw := strings.TrimSpace(planIn.Coupon); raw != "" {
+		couponCode = promo.CouponCode(raw)
+		if couponCode == "" || !engine.BillsMonthly(q.plan) {
+			return CryptoDeposit{}, depositValidationError{"coupon is not valid for this plan"}
+		}
+		offer, reason := promo.FindCoupon(ctx, couponCode, time.Now())
+		if reason == "" && !everyLine(q.slug, q.lines, offer.AppliesTo) {
+			reason = promo.CouponNotApplicable
+		}
+		if reason != "" {
+			return CryptoDeposit{}, depositValidationError{couponRefusal(couponCode, q.slug, reason)}
+		}
+		if promo.Redeemed(ctx, couponCode, org.Name) {
+			return CryptoDeposit{}, depositValidationError{fmt.Sprintf("%v (%s)", promo.ErrCouponRedeemedByOrg, couponCode)}
+		}
+		chargeCents = engine.Discounted(chargeCents, offer.Coupon().Percent)
+		if chargeCents <= 0 {
+			return CryptoDeposit{}, depositValidationError{"coupon leaves nothing to charge"}
+		}
+	}
+	dep, err := CreateCryptoDeposit(ctx, org, payer, chain, token, chargeCents)
+	if err != nil {
+		return CryptoDeposit{}, err
+	}
+	intent := cryptopaymentintent.New(db)
+	if err := intent.GetById(dep.ID); err == nil {
+		if intent.Metadata == nil {
+			intent.Metadata = types.Map{}
+		}
+		intent.Amount = chargeCents
+		intent.Metadata["planId"] = q.slug
+		intent.Metadata["quantity"] = q.qty
+		intent.Metadata["level"] = planIn.Level
+		intent.Metadata["interval"] = string(q.plan.Interval)
+		intent.Metadata["coupon"] = couponCode
+		intent.Metadata["chargeCents"] = chargeCents
+		_ = intent.Update()
+		dep = toCryptoDepositResponse(intent)
+	}
+	return dep, nil
+}
+
+// activateCryptoPlan opens a plan subscription once a plan-bound crypto deposit confirms.
+func activateCryptoPlan(ctx context.Context, orgName, subject string, intent *cryptopaymentintent.CryptoPaymentIntent, depositedCents int64, txHash string) (string, int64, error) {
+	if intent == nil || intent.Metadata == nil {
+		return "", 0, nil
+	}
+	planID, _ := intent.Metadata["planId"].(string)
+	planID = strings.TrimSpace(planID)
+	if planID == "" {
+		return "", 0, nil
+	}
+	chargeCents := intent.Amount
+	switch v := intent.Metadata["chargeCents"].(type) {
+	case float64:
+		if int64(v) > 0 {
+			chargeCents = int64(v)
+		}
+	case int64:
+		if v > 0 {
+			chargeCents = v
+		}
+	}
+	if chargeCents <= 0 || depositedCents < chargeCents {
+		// Underpaid deposit: credit the full amount to cash balance so nothing is lost.
+		return "", 0, nil
+	}
+	org, err := orgpkg.Resolve(ctx, orgName)
+	if err != nil || org == nil {
+		return "", 0, fmt.Errorf("resolve org %q: %w", orgName, err)
+	}
+	db := datastore.New(org.Namespaced(ctx))
+	// If subject already holds an active subscription for this plan, leave deposit in balance.
+	if held := billingSubscription(db, subject, org.TestMode()); held != nil && held.Status != subscription.Trialing {
+		heldSlug := held.Plan.Slug
+		if heldSlug == "" {
+			heldSlug = held.PlanId
+		}
+		if strings.EqualFold(heldSlug, planID) {
+			return held.Id(), 0, nil
+		}
+	}
+	qty := 1
+	switch v := intent.Metadata["quantity"].(type) {
+	case float64:
+		if int(v) > 0 {
+			qty = int(v)
+		}
+	case int:
+		if v > 0 {
+			qty = v
+		}
+	}
+	level := 0
+	switch v := intent.Metadata["level"].(type) {
+	case float64:
+		level = int(v)
+	case int:
+		level = v
+	}
+	intervalStr, _ := intent.Metadata["interval"].(string)
+	interval := types.Monthly
+	if intervalStr == string(types.Yearly) || intervalStr == "year" {
+		interval = types.Yearly
+	}
+	pl, err := resolveSubscriptionPlan(db, planID)
+	if err != nil {
+		return "", 0, err
+	}
+	if pl, err = planAt(pl, level, interval); err != nil {
+		return "", 0, err
+	}
+	lines, err := linesAt(db, pl, nil, pl.Interval, currency.USD)
+	if err != nil {
+		return "", 0, err
+	}
+	meta := map[string]interface{}{
+		"source":   "subscribe/crypto",
+		"intentId": intent.Id(),
+		"txHash":   txHash,
+	}
+	couponCode, _ := intent.Metadata["coupon"].(string)
+	var cpn engine.Coupon
+	var couponPlans []string
+	if couponCode != "" {
+		if offer, reason := promo.FindCoupon(ctx, couponCode, time.Now()); reason == "" {
+			cpn, couponPlans = offer.Coupon(), offer.Plans
+			meta["coupon"] = couponCode
+		}
+	}
+	sub, err := createSubscription(db, pl, &createSubscriptionRequest{
+		UserId:               subject,
+		PlanId:               pl.Slug,
+		DefaultPaymentMethod: "credits",
+		Quantity:             qty,
+		Metadata:             meta,
+		Test:                 org.TestMode(),
+		priced:               lines,
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	sub.ProviderType = "credit"
+	engine.Grant(sub, cpn, couponPlans, sub.PeriodStart)
+	ref := txHash
+	if ref == "" {
+		ref = intent.Id()
+	}
+	if inv, ierr := engine.CreatePaidFirstInvoice(db, sub, "crypto", ref); ierr == nil && inv != nil {
+		_ = paymentorg.Put(ref, org.Name, subject, inv.Id(), 0, org.TestMode())
+	} else {
+		log.Warn("crypto plan %s: paid first invoice not recorded for sub %s: %v", intent.Id(), sub.Id(), ierr)
+	}
+	return sub.Id(), chargeCents, nil
+}
+
 // CreateBillingCryptoDeposit is the payer's endpoint for the crypto rail. It
 // resolves who is asking, reads the asset off the body, and maps a refusal to
 // the code it has always mapped to.
 //
-//	POST /v1/billing/crypto/deposit   { chain?, token?, amountCents? }
+//	POST /v1/billing/crypto/deposit   { chain?, token?, amountCents?, planId? }
 func CreateBillingCryptoDeposit(c *zip.Ctx) error {
 	payer := userBillingKey(c)
 	if payer == "" {
@@ -684,7 +891,14 @@ func CreateBillingCryptoDeposit(c *zip.Ctx) error {
 		}
 	}
 
-	out, err := CreateCryptoDeposit(c.Context(), org, payer, req.Chain, req.Token, req.AmountCents)
+	out, err := CreateCryptoDepositForPlan(c.Context(), org, payer, req.Chain, req.Token, req.AmountCents, CryptoPlanIn{
+		PlanID:   req.PlanID,
+		Quantity: req.Quantity,
+		Level:    req.Level,
+		Interval: req.Interval,
+		Coupon:   req.Coupon,
+		Promo:    promo.Active(c),
+	})
 	switch {
 	case IsDepositUnsupported(err):
 		return jsonhttp.Fail(c, 400, err.Error(), nil)
@@ -819,6 +1033,14 @@ func toCryptoDepositResponse(i *cryptopaymentintent.CryptoPaymentIntent) CryptoD
 	}
 	if i.Status == cryptopaymentintent.Succeeded {
 		out.CreditedCents = i.SettlementAmount
+	}
+	if i.Metadata != nil {
+		if p, _ := i.Metadata["planId"].(string); p != "" {
+			out.PlanID = p
+		}
+		if s, _ := i.Metadata["subscriptionId"].(string); s != "" {
+			out.SubscriptionID = s
+		}
 	}
 	if terms, ok := termsFor(watchedAssets(), string(i.Chain), i.Token); ok {
 		out.FeeCents = terms.FeeCents

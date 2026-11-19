@@ -63,8 +63,8 @@ func TestPayPalContract_GuestPlanOrderOpens(t *testing.T) {
 	if f != nil {
 		t.Fatalf("guest plan PayPal order: %d %s (%v)", f.Status, f.Message, f.Err)
 	}
-	if out.Intent != "AUTHORIZE" || out.AmountCents != 1500 || out.Currency != "usd" {
-		t.Fatalf("order = %+v; want AUTHORIZE 1500 usd", out)
+	if out.Intent != "CAPTURE" || out.AmountCents != 1500 || out.Currency != "usd" {
+		t.Fatalf("order = %+v; want CAPTURE 1500 usd", out)
 	}
 	o := srv.Order(out.OrderID)
 	if o == nil || o.Status != "CREATED" || o.Value != "15.00" || o.Currency != "USD" || o.CustomID != "hanzo/guest-0123456789ab" {
