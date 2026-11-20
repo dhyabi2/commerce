@@ -102,6 +102,24 @@ func TestASavedCardSticksToItsProcessor(t *testing.T) {
 	}
 }
 
+func TestASavedCardDoesNotHijackNonCardMethodsOrASwitchedOffProcessor(t *testing.T) {
+	p := Default()
+	// A buyer with a saved Square card who explicitly chooses ACH (us_bank_account)
+	// must route to Stripe by method rather than being trapped on Square.
+	d := p.Decide(Input{Org: "hanzo", Key: "k", Country: "US", Currency: "usd", Saved: processor.Square, Method: "us_bank_account", Capable: squareCan(true)})
+	if d.Processor != processor.Stripe || d.Reason != "method" || d.Chain[0].Applied {
+		t.Fatalf("saved Square card hijacked us_bank_account: %+v", d)
+	}
+	// When Square is switched off (100% Stripe routing), a saved Square card must not
+	// send a new card checkout to Square.
+	switchOff(&p, processor.Square)
+	split(&p, 0, 100)
+	d = p.Decide(Input{Org: "hanzo", Key: "k", Country: "US", Currency: "usd", Saved: processor.Square, Capable: squareCan(true)})
+	if d.Processor != processor.Stripe || d.Reason == "saved" || d.Chain[0].Applied {
+		t.Fatalf("switched-off Square still claimed saved-card checkout: %+v", d)
+	}
+}
+
 func TestAProcessorSwitchedOffTakesNoNewCheckout(t *testing.T) {
 	p := Default()
 	switchOff(&p, processor.Square)

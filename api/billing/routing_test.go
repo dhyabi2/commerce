@@ -1169,4 +1169,24 @@ func TestASavedCardOnlyHoldsTheBuyerWhereItsProcessorCanCharge(t *testing.T) {
 	if _, f := OpenTopupIntent(ctx, org, TopupIntentIn{Subject: "holder", Country: "DE", AmountCents: 500, Currency: "eur"}); f != nil && f.Status == 503 && strings.Contains(f.Message, "saved card") {
 		t.Fatalf("a euro top-up with a saved Square card answered the saved card's 503: %v", f.Message)
 	}
+	// Choosing ACH while holding a saved Square card routes to Stripe (never 409 "this checkout is on square").
+	for _, m := range []string{"ach", "us_bank_account"} {
+		d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: "US", Currency: "usd", Method: m})
+		if f != nil || d.Processor != processor.Stripe || d.Reason != "method" {
+			t.Fatalf("a saved Square card paying via %s: %+v %v; want Stripe (method)", m, d, f)
+		}
+	}
+	if _, f := OpenTopupIntent(ctx, org, TopupIntentIn{Subject: "holder", Country: "US", AmountCents: 2000, Method: "ach"}); f != nil && f.Status == 409 {
+		t.Fatalf("an ACH top-up with a saved Square card hit 409: %v", f.Message)
+	}
+	// When Square is switched off in policy (100% Stripe), a buyer with a saved Square card
+	// falls through to Stripe rather than getting routed to an unmounted Square card form.
+	stripeOnly := withWeight(0)
+	setOn(&stripeOnly, "square", false)
+	if _, f := WriteRouting(ctx, org.Name, stripeOnly, "z", "100% stripe"); f != nil {
+		t.Fatal(f.Err)
+	}
+	if d, f := Place(ctx, org, RouteIn{Subject: "holder", Country: "US", Currency: "usd"}); f != nil || d.Processor != processor.Stripe || d.Reason == "saved" {
+		t.Fatalf("with Square switched off, a saved Square card holder routed to %+v %v; want Stripe", d, f)
+	}
 }

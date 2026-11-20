@@ -856,9 +856,13 @@ func (p Policy) Decide(in Input) Decision {
 	}
 
 	// 1. saved
-	if in.Saved != "" {
+	if in.Saved != "" && (method == "" || method == "card") && p.On(in.Saved) {
 		set(in.Saved, "saved", "saved")
 		step("saved", true, "a card is saved at "+string(in.Saved)+", so the charge stays there whatever the policy says")
+	} else if in.Saved != "" && method != "" && method != "card" {
+		step("saved", false, "a card is saved at "+string(in.Saved)+", but the buyer chose "+method)
+	} else if in.Saved != "" {
+		step("saved", false, "a card is saved at "+string(in.Saved)+", but "+string(in.Saved)+" is switched off")
 	} else {
 		step("saved", false, "no saved method")
 	}
